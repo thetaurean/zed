@@ -14,8 +14,8 @@ use feature_flags::AcpBetaFeatureFlag;
 
 use crate::message_editor::SharedSessionCapabilities;
 
-use gpui::List;
 use gpui::TaskExt;
+use gpui::{KeyContext, List};
 use heapless::Vec as ArrayVec;
 use language_model::{LanguageModelEffortLevel, Speed};
 use settings::{SidebarSide, update_settings_file};
@@ -1651,6 +1651,22 @@ impl ThreadView {
             self.message_editor.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
+    }
+
+    fn key_context(&self, window: &Window, cx: &App) -> KeyContext {
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add("AcpThread");
+
+        if !self.thread_search.dismissed
+            && self
+                .thread_search
+                .query_editor_focus_handle(cx)
+                .contains_focused(window, cx)
+        {
+            key_context.add("ThreadSearch");
+        }
+
+        key_context
     }
 
     fn refresh_thread_search(&mut self, cx: &mut Context<Self>) {
@@ -9255,7 +9271,7 @@ impl Render for ThreadView {
             });
 
         v_flex()
-            .key_context("AcpThread")
+            .key_context(self.key_context(window, cx))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
