@@ -4563,7 +4563,6 @@ impl AgentPanel {
 
         let search_button = {
             let focus_handle = focus_handle.clone();
-            let active_thread_focus_handle = active_thread_focus_handle.clone();
             IconButton::new("thread-search-toggle", IconName::MagnifyingGlass)
                 .shape(ui::IconButtonShape::Square)
                 .icon_size(IconSize::Small)
