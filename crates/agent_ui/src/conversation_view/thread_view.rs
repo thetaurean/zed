@@ -553,6 +553,20 @@ impl ThreadView {
                 }
             },
         ));
+        thread_search
+            ._subscriptions
+            .push(cx.subscribe(&thread, |this, _thread, event, cx| {
+                if matches!(
+                    event,
+                    AcpThreadEvent::NewEntry
+                        | AcpThreadEvent::EntryUpdated(_)
+                        | AcpThreadEvent::EntriesRemoved(_)
+                ) && !this.thread_search.dismissed
+                    && !this.thread_search.query(cx).is_empty()
+                {
+                    this.refresh_thread_search(cx);
+                }
+            }));
 
         let mut this = Self {
             root_thread_id,
@@ -1630,7 +1644,9 @@ impl ThreadView {
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.thread_search.dismissed {
             self.thread_search.deploy(window, cx);
+            self.refresh_thread_search(cx);
         } else {
+            self.thread_search.clear_highlights(cx);
             self.thread_search.dismiss(window, cx);
             self.message_editor.focus_handle(cx).focus(window, cx);
         }
@@ -1638,12 +1654,14 @@ impl ThreadView {
     }
 
     fn refresh_thread_search(&mut self, cx: &mut Context<Self>) {
+        self.thread_search.clear_highlights(cx);
         let entries = self.thread.read(cx).entries();
         let sources = super::thread_search::collect_searchable_markdowns(
             entries,
             self.thread_search.include_tool_calls,
         );
         self.thread_search.update_matches(&sources, cx);
+        self.thread_search.apply_highlights(cx);
         cx.notify();
     }
 

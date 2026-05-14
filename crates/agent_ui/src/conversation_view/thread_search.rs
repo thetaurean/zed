@@ -1,4 +1,7 @@
-use std::ops::Range;
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use acp_thread::{AgentThreadEntry, AssistantMessageChunk, ContentBlock, ToolCallContent};
 use editor::Editor;
@@ -76,6 +79,43 @@ impl ThreadSearch {
         }
 
         self.active_match_index = (!self.matches.is_empty()).then_some(0);
+    }
+
+    pub fn apply_highlights(&self, cx: &mut gpui::App) {
+        let mut highlights_by_markdown: HashMap<
+            Entity<Markdown>,
+            (Vec<Range<usize>>, Option<usize>),
+        > = HashMap::default();
+
+        for (match_index, search_match) in self.matches.iter().enumerate() {
+            let (ranges, active) = highlights_by_markdown
+                .entry(search_match.markdown.clone())
+                .or_default();
+            let local_match_index = ranges.len();
+            ranges.push(search_match.range.clone());
+
+            if self.active_match_index == Some(match_index) {
+                *active = Some(local_match_index);
+            }
+        }
+
+        for (markdown, (ranges, active)) in highlights_by_markdown {
+            markdown.update(cx, |markdown, cx| {
+                markdown.set_search_highlights(ranges, active, cx);
+            });
+        }
+    }
+
+    pub fn clear_highlights(&self, cx: &mut gpui::App) {
+        let mut cleared_markdowns = HashSet::<Entity<Markdown>>::new();
+
+        for search_match in &self.matches {
+            if cleared_markdowns.insert(search_match.markdown.clone()) {
+                search_match.markdown.update(cx, |markdown, cx| {
+                    markdown.clear_search_highlights(cx);
+                });
+            }
+        }
     }
 
     pub fn deploy(&mut self, window: &mut Window, cx: &mut gpui::App) {
@@ -258,6 +298,84 @@ fn find_match_at_start(query_lower: &str, text: &str, start: usize) -> Option<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Render, TestAppContext};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct TestWindow;
+
+    impl Render for TestWindow {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn apply_highlights_groups_by_markdown_and_sets_local_active(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let markdown_a = cx.new(|cx| Markdown::new("one two one".into(), None, None, cx));
+        let markdown_b = cx.new(|cx| Markdown::new("two one".into(), None, None, cx));
+        let query_editor = Rc::new(RefCell::new(None));
+        cx.add_window({
+            let query_editor = query_editor.clone();
+            move |window, cx| {
+                let editor = cx.new(|cx| Editor::single_line(window, cx));
+                *query_editor.borrow_mut() = Some(editor);
+                TestWindow
+            }
+        });
+        let query_editor = match query_editor.borrow().clone() {
+            Some(query_editor) => query_editor,
+            None => panic!("test window should create query editor"),
+        };
+        let thread_search = ThreadSearch {
+            query_editor,
+            dismissed: false,
+            include_tool_calls: false,
+            options: SearchOptions::default(),
+            matches: vec![
+                SearchMatch {
+                    entry_index: 0,
+                    markdown: markdown_a.clone(),
+                    range: 0..3,
+                },
+                SearchMatch {
+                    entry_index: 1,
+                    markdown: markdown_b.clone(),
+                    range: 4..7,
+                },
+                SearchMatch {
+                    entry_index: 0,
+                    markdown: markdown_a.clone(),
+                    range: 8..11,
+                },
+            ],
+            active_match_index: Some(2),
+            _subscriptions: Vec::new(),
+        };
+
+        cx.update(|cx| thread_search.apply_highlights(cx));
+
+        cx.update(|cx| {
+            assert_eq!(markdown_a.read(cx).search_highlights(), &[0..3, 8..11]);
+            assert_eq!(markdown_a.read(cx).active_search_highlight(), Some(1));
+            assert_eq!(markdown_b.read(cx).search_highlights(), &[4..7]);
+            assert_eq!(markdown_b.read(cx).active_search_highlight(), None);
+        });
+
+        cx.update(|cx| thread_search.clear_highlights(cx));
+
+        cx.update(|cx| {
+            assert!(markdown_a.read(cx).search_highlights().is_empty());
+            assert_eq!(markdown_a.read(cx).active_search_highlight(), None);
+            assert!(markdown_b.read(cx).search_highlights().is_empty());
+            assert_eq!(markdown_b.read(cx).active_search_highlight(), None);
+        });
+    }
 
     #[test]
     fn empty_query_returns_no_matches() {
