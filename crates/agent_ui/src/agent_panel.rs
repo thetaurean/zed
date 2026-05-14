@@ -4261,6 +4261,9 @@ impl AgentPanel {
             }
             BaseView::Terminal { .. } | BaseView::Uninitialized => None,
         };
+        let active_thread_focus_handle = self
+            .active_conversation_view()
+            .map(|conversation_view| conversation_view.focus_handle(cx));
 
         let new_thread_menu_builder: Rc<
             dyn Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>>,
@@ -4558,6 +4561,22 @@ impl AgentPanel {
                 this.toggle_zoom(&ToggleZoom, window, cx);
             }));
 
+        let search_button = {
+            let focus_handle = focus_handle.clone();
+            let active_thread_focus_handle = active_thread_focus_handle.clone();
+            IconButton::new("thread-search-toggle", IconName::MagnifyingGlass)
+                .shape(ui::IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .tooltip(move |_window, cx| {
+                    Tooltip::for_action_in("Search Thread", &crate::ToggleSearch, &focus_handle, cx)
+                })
+                .on_click(move |_, window, cx| {
+                    if let Some(focus_handle) = &active_thread_focus_handle {
+                        focus_handle.dispatch_action(&crate::ToggleSearch, window, cx);
+                    }
+                })
+        };
+
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
         let base_container = h_flex()
@@ -4681,6 +4700,9 @@ impl AgentPanel {
                         .pl_1()
                         .pr_1()
                         .when(can_create_entries, |this| this.child(new_thread_menu))
+                        .when(matches!(mode, ToolbarMode::ActiveThread), |this| {
+                            this.child(search_button)
+                        })
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
