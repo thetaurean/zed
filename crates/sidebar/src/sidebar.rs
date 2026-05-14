@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use theme::ActiveTheme;
+use theme_settings::ThemeSettings;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, Disclosure, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
@@ -293,6 +294,55 @@ enum ListEntry {
     },
     Thread(ThreadEntry),
     Terminal(TerminalEntry),
+}
+
+pub use workspace::DropEdge;
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum DraggedSidebarHeader {
+    Project(ProjectGroupKey),
+    Worktree {
+        project_group_key: ProjectGroupKey,
+        worktree_path: PathBuf,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DropTargetIndicator {
+    Project {
+        target_key: ProjectGroupKey,
+        edge: DropEdge,
+    },
+    Worktree {
+        project_group_key: ProjectGroupKey,
+        target_path: PathBuf,
+        edge: DropEdge,
+    },
+}
+
+#[allow(dead_code)]
+struct DraggedHeaderView {
+    label: SharedString,
+    width: Pixels,
+}
+
+impl Render for DraggedHeaderView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui_font = ThemeSettings::get_global(cx).ui_font.family.clone();
+        h_flex()
+            .font_family(ui_font)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_md()
+            .shadow_md()
+            .px_2()
+            .py_1()
+            .w(self.width)
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+    }
 }
 
 #[derive(Clone)]
@@ -708,6 +758,7 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
+    drop_target: Option<DropTargetIndicator>,
 
     /// Updated only in response to explicit user actions (clicking a
     /// thread, confirming in the thread switcher, etc.) — never from
@@ -811,6 +862,7 @@ impl Sidebar {
             selection: None,
             active_entry: None,
             hovered_thread_index: None,
+            drop_target: None,
 
             thread_last_accessed: HashMap::new(),
             terminal_last_accessed: HashMap::new(),
@@ -1902,6 +1954,7 @@ impl Sidebar {
         let scroll_position = self.list_state.logical_scroll_top();
 
         self.rebuild_contents(cx);
+        self.clear_drop_target(cx);
         self.refresh_draft_editor_observations(cx);
 
         self.list_state.reset(self.contents.entries.len());
@@ -1914,6 +1967,13 @@ impl Sidebar {
         }
 
         cx.notify();
+    }
+
+    fn clear_drop_target(&mut self, cx: &mut Context<Self>) {
+        if self.drop_target.is_some() {
+            self.drop_target = None;
+            cx.notify();
+        }
     }
 
     /// Re-establishes subscriptions to each visible draft's message editor
