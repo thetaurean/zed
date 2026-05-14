@@ -504,6 +504,23 @@ impl WorktreeGroupOverrideKey {
     }
 }
 
+/// Key for per-(group, worktree) ordering state.
+/// `group_path_list_canonical` is the serialized canonical path list of the
+/// owning `ProjectGroupKey`. Position is 0-based ascending; missing paths sort
+/// last by natural order.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct WorktreeOrderKey {
+    pub remote_connection_identity: String,
+    pub group_path_list_canonical: String,
+    pub worktree_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct WorktreeOrderGroupKey {
+    remote_connection_identity: String,
+    group_path_list_canonical: String,
+}
+
 struct WorktreeOverrideRow {
     key: WorktreeGroupOverrideKey,
     custom_name: Option<String>,
@@ -511,7 +528,6 @@ struct WorktreeOverrideRow {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct WorktreeOrderRow {
     remote_connection_identity: String,
     group_path_list: String,
@@ -529,8 +545,11 @@ pub struct ThreadMetadataStore {
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     worktree_overrides: HashMap<WorktreeGroupOverrideKey, WorktreeGroupOverride>,
+    worktree_order: HashMap<WorktreeOrderKey, u32>,
+    worktree_order_loaded: bool,
     worktree_overrides_loaded: bool,
     dirty_worktree_override_keys: HashSet<WorktreeGroupOverrideKey>,
+    dirty_worktree_order_groups: HashSet<WorktreeOrderGroupKey>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -1460,6 +1479,43 @@ impl ThreadMetadataStore {
         })
         .detach();
 
+        let load_worktree_order_task = cx.background_spawn({
+            let db = db.clone();
+            async move {
+                db.load_worktree_order()
+                    .await
+                    .context("Failed to fetch worktree group order")
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let Some(rows) = load_worktree_order_task.await.log_err() else {
+                return;
+            };
+
+            this.update(cx, |this, cx| {
+                for row in rows {
+                    let group_key = WorktreeOrderGroupKey {
+                        remote_connection_identity: row.remote_connection_identity.clone(),
+                        group_path_list_canonical: row.group_path_list.clone(),
+                    };
+                    if this.dirty_worktree_order_groups.contains(&group_key) {
+                        continue;
+                    }
+
+                    let key = WorktreeOrderKey {
+                        remote_connection_identity: row.remote_connection_identity,
+                        group_path_list_canonical: row.group_path_list,
+                        worktree_path: row.worktree_path,
+                    };
+                    this.worktree_order.insert(key, row.position);
+                }
+                this.worktree_order_loaded = true;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+
         let mut this = Self {
             db,
             threads: HashMap::default(),
@@ -1467,8 +1523,11 @@ impl ThreadMetadataStore {
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
             worktree_overrides: HashMap::default(),
+            worktree_order: HashMap::default(),
+            worktree_order_loaded: false,
             worktree_overrides_loaded: false,
             dirty_worktree_override_keys: HashSet::default(),
+            dirty_worktree_order_groups: HashSet::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1848,7 +1907,6 @@ impl ThreadMetadataDb {
         .await
     }
 
-    #[allow(dead_code)]
     async fn load_worktree_order(&self) -> anyhow::Result<Vec<WorktreeOrderRow>> {
         self.write(move |conn| {
             conn.select::<WorktreeOrderRow>(
