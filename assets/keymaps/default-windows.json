@@ -228,9 +228,19 @@
       "shift-alt-c": "agent::OpenSettings",
       "shift-alt-i": "agent::ToggleOptionsMenu",
       "ctrl-shift-alt-n": "agent::ToggleNewThreadMenu",
+      "ctrl-f": "agent::ToggleSearch",
       "ctrl-shift-e": "project_panel::ToggleFocus",
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
       "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],
+    },
+  },
+  {
+    "context": "AgentPanel > ThreadSearch",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "agent::ToggleSearch",
+      "enter": "menu::SelectNext",
+      "shift-enter": "menu::SelectPrevious",
     },
   },
   {

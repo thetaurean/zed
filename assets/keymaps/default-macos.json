@@ -267,9 +267,19 @@
       "cmd-alt-c": "agent::OpenSettings",
       "cmd-alt-m": "agent::ToggleOptionsMenu",
       "cmd-alt-shift-n": "agent::ToggleNewThreadMenu",
+      "cmd-f": "agent::ToggleSearch",
       "cmd-shift-e": "project_panel::ToggleFocus",
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
       "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],
+    },
+  },
+  {
+    "context": "AgentPanel > ThreadSearch",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "agent::ToggleSearch",
+      "enter": "menu::SelectNext",
+      "shift-enter": "menu::SelectPrevious",
     },
   },
   {
