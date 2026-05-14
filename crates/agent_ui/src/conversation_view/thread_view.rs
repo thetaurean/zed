@@ -1701,6 +1701,48 @@ impl ThreadView {
         self.refresh_thread_search(cx);
     }
 
+    fn toggle_search_case_sensitive(
+        &mut self,
+        _: &crate::ToggleSearchCaseSensitive,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.options.case_sensitive = !self.thread_search.options.case_sensitive;
+        self.refresh_thread_search(cx);
+    }
+
+    fn toggle_search_whole_word(
+        &mut self,
+        _: &crate::ToggleSearchWholeWord,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.options.whole_word = !self.thread_search.options.whole_word;
+        self.refresh_thread_search(cx);
+    }
+
+    fn toggle_search_regex(
+        &mut self,
+        _: &crate::ToggleSearchRegex,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.options.regex = !self.thread_search.options.regex;
+        self.refresh_thread_search(cx);
+    }
+
     fn advance_thread_search(&mut self, delta: isize, cx: &mut Context<Self>) {
         let active_entry_index = self.thread_search.step_active(delta);
         self.thread_search.apply_highlights(cx);
@@ -9254,6 +9296,9 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::thread_search_select_next))
             .on_action(cx.listener(Self::thread_search_select_prev))
             .on_action(cx.listener(Self::toggle_search_include_tool_calls))
+            .on_action(cx.listener(Self::toggle_search_case_sensitive))
+            .on_action(cx.listener(Self::toggle_search_whole_word))
+            .on_action(cx.listener(Self::toggle_search_regex))
             .on_action(cx.listener(|this, _: &ToggleFastMode, _window, cx| {
                 this.toggle_fast_mode(cx);
             }))

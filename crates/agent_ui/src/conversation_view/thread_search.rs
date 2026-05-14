@@ -10,6 +10,7 @@ use gpui::{
     Styled, Subscription, Window, div,
 };
 use markdown::Markdown;
+use regex::RegexBuilder;
 use ui::{
     ActiveTheme, ButtonCommon, Clickable, Color, IconButton, IconButtonShape, IconName, IconSize,
     Label, LabelCommon, LabelSize, Toggleable, Tooltip, h_flex,
@@ -66,7 +67,7 @@ impl ThreadSearch {
         for (entry_index, markdown) in sources {
             let ranges = {
                 let markdown = markdown.read(cx);
-                find_matches_in_text(&query, markdown.source())
+                find_matches_in_text(&query, markdown.source(), self.options)
             };
 
             for range in ranges {
@@ -197,6 +198,36 @@ impl ThreadSearch {
                         .tooltip(Tooltip::text("Next Match")),
                 )
                 .child(
+                    IconButton::new("thread-search-toggle-case", IconName::CaseSensitive)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.options.case_sensitive)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(crate::ToggleSearchCaseSensitive), cx);
+                        })
+                        .tooltip(Tooltip::text("Match Case")),
+                )
+                .child(
+                    IconButton::new("thread-search-toggle-word", IconName::WholeWord)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.options.whole_word)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(crate::ToggleSearchWholeWord), cx);
+                        })
+                        .tooltip(Tooltip::text("Match Whole Word")),
+                )
+                .child(
+                    IconButton::new("thread-search-toggle-regex", IconName::Regex)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.options.regex)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(crate::ToggleSearchRegex), cx);
+                        })
+                        .tooltip(Tooltip::text("Use Regular Expression")),
+                )
+                .child(
                     IconButton::new("thread-search-toggle-tools", IconName::ToolHammer)
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
@@ -283,16 +314,54 @@ pub struct SearchMatch {
     pub range: Range<usize>,
 }
 
-/// Find every case-insensitive substring match of `query` in `text`.
+/// Find every search match of `query` in `text`.
 ///
 /// Returns ranges over byte offsets into `text` (suitable for
 /// [`markdown::Markdown::set_search_highlights`]). Empty queries return no
 /// matches. Matches do not overlap; the search advances past each match.
-pub fn find_matches_in_text(query: &str, text: &str) -> Vec<Range<usize>> {
+pub fn find_matches_in_text(query: &str, text: &str, options: SearchOptions) -> Vec<Range<usize>> {
     if query.is_empty() {
         return Vec::new();
     }
 
+    let matches = if options.regex {
+        find_regex_matches(query, text, options.case_sensitive)
+    } else if options.case_sensitive {
+        find_case_sensitive_literal_matches(query, text)
+    } else {
+        find_case_insensitive_literal_matches(query, text)
+    };
+
+    if options.whole_word {
+        matches
+            .into_iter()
+            .filter(|range| is_whole_word_match(text, range))
+            .collect()
+    } else {
+        matches
+    }
+}
+
+fn find_case_sensitive_literal_matches(query: &str, text: &str) -> Vec<Range<usize>> {
+    let mut matches = Vec::new();
+    let mut start = 0;
+
+    while start < text.len() {
+        match text[start..].find(query) {
+            Some(relative_start) => {
+                let match_start = start + relative_start;
+                let match_end = match_start + query.len();
+                matches.push(match_start..match_end);
+                start = match_end;
+            }
+            None => break,
+        }
+    }
+
+    matches
+}
+
+fn find_case_insensitive_literal_matches(query: &str, text: &str) -> Vec<Range<usize>> {
     let query_lower = query.to_lowercase();
     let mut matches = Vec::new();
     let mut start = 0;
@@ -311,6 +380,24 @@ pub fn find_matches_in_text(query: &str, text: &str) -> Vec<Range<usize>> {
     matches
 }
 
+fn find_regex_matches(query: &str, text: &str, case_sensitive: bool) -> Vec<Range<usize>> {
+    let regex = match RegexBuilder::new(query)
+        .case_insensitive(!case_sensitive)
+        .build()
+    {
+        Ok(regex) => regex,
+        Err(_) => return Vec::new(),
+    };
+
+    regex
+        .find_iter(text)
+        .filter_map(|regex_match| {
+            (regex_match.start() != regex_match.end())
+                .then_some(regex_match.start()..regex_match.end())
+        })
+        .collect()
+}
+
 fn find_match_at_start(query_lower: &str, text: &str, start: usize) -> Option<usize> {
     let mut folded_text = String::new();
 
@@ -325,11 +412,34 @@ fn find_match_at_start(query_lower: &str, text: &str, start: usize) -> Option<us
     None
 }
 
+fn is_whole_word_match(text: &str, range: &Range<usize>) -> bool {
+    let previous_char = text[..range.start].chars().next_back();
+    let next_char = text[range.end..].chars().next();
+
+    !previous_char.is_some_and(is_search_word_char) && !next_char.is_some_and(is_search_word_char)
+}
+
+fn is_search_word_char(char: char) -> bool {
+    char.is_alphanumeric() || char == '_'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{Render, TestAppContext};
     use std::{cell::RefCell, rc::Rc};
+
+    fn find_matches(query: &str, text: &str) -> Vec<Range<usize>> {
+        find_matches_in_text(query, text, SearchOptions::default())
+    }
+
+    fn find_matches_with_options(
+        query: &str,
+        text: &str,
+        options: SearchOptions,
+    ) -> Vec<Range<usize>> {
+        find_matches_in_text(query, text, options)
+    }
 
     struct TestWindow;
 
@@ -409,43 +519,147 @@ mod tests {
 
     #[test]
     fn empty_query_returns_no_matches() {
-        assert!(find_matches_in_text("", "hello world").is_empty());
+        assert!(find_matches("", "hello world").is_empty());
     }
 
     #[test]
     fn no_matches_for_missing_substring() {
-        assert!(find_matches_in_text("xyz", "hello world").is_empty());
+        assert!(find_matches("xyz", "hello world").is_empty());
     }
 
     #[test]
     fn finds_single_match() {
-        assert_eq!(find_matches_in_text("world", "hello world"), vec![6..11]);
+        assert_eq!(find_matches("world", "hello world"), vec![6..11]);
     }
 
     #[test]
     fn finds_multiple_non_overlapping_matches() {
-        assert_eq!(
-            find_matches_in_text("ab", "abcabcab"),
-            vec![0..2, 3..5, 6..8],
-        );
+        assert_eq!(find_matches("ab", "abcabcab"), vec![0..2, 3..5, 6..8]);
     }
 
     #[test]
     fn is_case_insensitive() {
         assert_eq!(
-            find_matches_in_text("Hello", "hello HELLO HeLLo"),
+            find_matches("Hello", "hello HELLO HeLLo"),
             vec![0..5, 6..11, 12..17],
         );
     }
 
     #[test]
     fn advances_past_each_match_no_overlap() {
-        assert_eq!(find_matches_in_text("aa", "aaa"), vec![0..2]);
+        assert_eq!(find_matches("aa", "aaa"), vec![0..2]);
     }
 
     #[test]
     fn returns_original_byte_ranges_when_lowercase_expands() {
-        assert_eq!(find_matches_in_text("x", "İx"), vec![2..3]);
+        assert_eq!(find_matches("x", "İx"), vec![2..3]);
+    }
+
+    #[test]
+    fn case_sensitive_search_matches_only_exact_case() {
+        assert_eq!(
+            find_matches_with_options(
+                "Hello",
+                "hello HELLO Hello",
+                SearchOptions {
+                    case_sensitive: true,
+                    ..SearchOptions::default()
+                },
+            ),
+            vec![12..17],
+        );
+    }
+
+    #[test]
+    fn whole_word_search_filters_embedded_matches() {
+        assert_eq!(
+            find_matches_with_options(
+                "cat",
+                "cat scatter cat-cat cat1 _cat cat_",
+                SearchOptions {
+                    whole_word: true,
+                    ..SearchOptions::default()
+                },
+            ),
+            vec![0..3, 12..15, 16..19],
+        );
+    }
+
+    #[test]
+    fn regex_search_returns_match_ranges() {
+        assert_eq!(
+            find_matches_with_options(
+                r"\bcat\d+\b",
+                "cat cat12 Cat34",
+                SearchOptions {
+                    regex: true,
+                    ..SearchOptions::default()
+                },
+            ),
+            vec![4..9, 10..15],
+        );
+    }
+
+    #[test]
+    fn case_sensitive_regex_search_matches_only_exact_case() {
+        assert_eq!(
+            find_matches_with_options(
+                r"\bcat\d+\b",
+                "cat12 Cat34",
+                SearchOptions {
+                    case_sensitive: true,
+                    regex: true,
+                    ..SearchOptions::default()
+                },
+            ),
+            vec![0..5],
+        );
+    }
+
+    #[test]
+    fn invalid_regex_returns_no_matches() {
+        assert!(
+            find_matches_with_options(
+                "(",
+                "hello",
+                SearchOptions {
+                    regex: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn zero_length_regex_matches_are_ignored() {
+        assert!(
+            find_matches_with_options(
+                r"\b",
+                "hello",
+                SearchOptions {
+                    regex: true,
+                    ..SearchOptions::default()
+                },
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn whole_word_filters_regex_ranges() {
+        assert_eq!(
+            find_matches_with_options(
+                r"cat\d*",
+                "cat cat12 scatter cat-cat",
+                SearchOptions {
+                    whole_word: true,
+                    regex: true,
+                    ..SearchOptions::default()
+                },
+            ),
+            vec![0..3, 4..9, 18..21, 22..25],
+        );
     }
 
     #[test]

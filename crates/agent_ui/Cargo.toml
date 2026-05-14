@@ -86,6 +86,7 @@ rand.workspace = true
 release_channel.workspace = true
 remote.workspace = true
 remote_connection.workspace = true
+regex.workspace = true
 rope.workspace = true
 rules_library.workspace = true
 schemars.workspace = true

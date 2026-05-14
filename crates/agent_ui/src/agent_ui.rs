@@ -222,6 +222,12 @@ actions!(
         ToggleSearch,
         /// Toggles whether thread search includes tool call titles and outputs.
         ToggleSearchIncludeToolCalls,
+        /// Toggles whether thread search matches case exactly.
+        ToggleSearchCaseSensitive,
+        /// Toggles whether thread search matches whole words only.
+        ToggleSearchWholeWord,
+        /// Toggles whether thread search interprets the query as a regular expression.
+        ToggleSearchRegex,
     ]
 );
 
