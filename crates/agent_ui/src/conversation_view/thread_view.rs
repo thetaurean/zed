@@ -9288,6 +9288,7 @@ impl Render for ThreadView {
             }))
             .size_full()
             .children(self.render_subagent_titlebar(cx))
+            .children(self.thread_search.render(cx))
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
             .children(self.render_skill_loading_errors(cx))

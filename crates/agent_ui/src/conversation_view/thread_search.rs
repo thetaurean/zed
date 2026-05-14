@@ -1,8 +1,14 @@
 use std::ops::Range;
 
 use editor::Editor;
-use gpui::{Entity, Subscription, Window};
+use gpui::{
+    AnyElement, AppContext, Entity, IntoElement, ParentElement, Styled, Subscription, Window, div,
+};
 use markdown::Markdown;
+use ui::{
+    ActiveTheme, ButtonCommon, Color, IconButton, IconButtonShape, IconName, IconSize, Label,
+    LabelCommon, LabelSize, Toggleable, Tooltip, h_flex,
+};
 
 #[derive(Default, Clone, Copy)]
 pub struct SearchOptions {
@@ -42,6 +48,62 @@ impl ThreadSearch {
     pub fn query(&self, cx: &gpui::App) -> String {
         self.query_editor.read(cx).text(cx)
     }
+
+    pub fn render(&self, cx: &mut gpui::App) -> Option<AnyElement> {
+        if self.dismissed {
+            return None;
+        }
+
+        Some(
+            h_flex()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().editor_background)
+                .child(div().flex_1().min_w_0().child(self.query_editor.clone()))
+                .child(
+                    Label::new(format_match_counter(
+                        self.active_match_index,
+                        self.matches.len(),
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(
+                    IconButton::new("thread-search-prev", IconName::ChevronUp)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Previous Match")),
+                )
+                .child(
+                    IconButton::new("thread-search-next", IconName::ChevronDown)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Next Match")),
+                )
+                .child(
+                    IconButton::new("thread-search-toggle-tools", IconName::ToolHammer)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.include_tool_calls)
+                        .tooltip(Tooltip::text("Include Tool Calls")),
+                )
+                .child(
+                    IconButton::new("thread-search-close", IconName::Close)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Close Search")),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+fn format_match_counter(active_match_index: Option<usize>, match_count: usize) -> String {
+    let active_match_number = active_match_index.map_or(0, |index| index + 1);
+    format!("{active_match_number}/{match_count}")
 }
 
 #[derive(Clone)]
@@ -136,5 +198,12 @@ mod tests {
     #[test]
     fn returns_original_byte_ranges_when_lowercase_expands() {
         assert_eq!(find_matches_in_text("x", "İx"), vec![2..3]);
+    }
+
+    #[test]
+    fn formats_match_counter() {
+        assert_eq!(format_match_counter(None, 0), "0/0");
+        assert_eq!(format_match_counter(Some(0), 3), "1/3");
+        assert_eq!(format_match_counter(Some(2), 3), "3/3");
     }
 }
