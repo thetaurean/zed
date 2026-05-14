@@ -510,6 +510,15 @@ struct WorktreeOverrideRow {
     collapsed: bool,
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct WorktreeOrderRow {
+    remote_connection_identity: String,
+    group_path_list: String,
+    worktree_path: PathBuf,
+    position: u32,
+}
+
 /// The store holds all metadata needed to show threads in the sidebar/the archive.
 ///
 /// Listens to ConversationView events and updates metadata when the root thread changes.
@@ -1839,6 +1848,115 @@ impl ThreadMetadataDb {
         .await
     }
 
+    #[allow(dead_code)]
+    async fn load_worktree_order(&self) -> anyhow::Result<Vec<WorktreeOrderRow>> {
+        self.write(move |conn| {
+            conn.select::<WorktreeOrderRow>(
+                "SELECT remote_connection_identity, group_path_list, worktree_path, position \
+                 FROM worktree_group_order \
+                 ORDER BY remote_connection_identity, group_path_list, position",
+            )?()
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    async fn upsert_worktree_order_entries(
+        &self,
+        remote_connection_identity: String,
+        group_path_list: String,
+        ordered_paths: Vec<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let ordered_paths = ordered_paths
+            .into_iter()
+            .map(Self::path_to_db_string)
+            .collect::<Vec<_>>();
+
+        self.write(move |conn| {
+            conn.with_savepoint("upsert_worktree_group_order", || {
+                let mut delete_stmt = Statement::prepare(
+                    conn,
+                    "DELETE FROM worktree_group_order \
+                     WHERE remote_connection_identity = ?1 AND group_path_list = ?2",
+                )?;
+                let next_index = delete_stmt.bind(&remote_connection_identity, 1)?;
+                delete_stmt.bind(&group_path_list, next_index)?;
+                delete_stmt.exec()?;
+
+                if ordered_paths.is_empty() {
+                    return Ok(());
+                }
+
+                let mut insert_stmt = Statement::prepare(
+                    conn,
+                    "INSERT INTO worktree_group_order(\
+                         remote_connection_identity, group_path_list, worktree_path, position) \
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                for (position, path) in ordered_paths.iter().enumerate() {
+                    insert_stmt.reset();
+                    let mut next_index = insert_stmt.bind(&remote_connection_identity, 1)?;
+                    next_index = insert_stmt.bind(&group_path_list, next_index)?;
+                    next_index = insert_stmt.bind(path, next_index)?;
+                    insert_stmt.bind(&(position as i64), next_index)?;
+                    insert_stmt.exec()?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    async fn delete_worktree_order_for_group(
+        &self,
+        remote_connection_identity: String,
+        group_path_list: String,
+    ) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "DELETE FROM worktree_group_order \
+                 WHERE remote_connection_identity = ?1 AND group_path_list = ?2",
+            )?;
+            let next_index = stmt.bind(&remote_connection_identity, 1)?;
+            stmt.bind(&group_path_list, next_index)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    async fn delete_worktree_order_not_in_groups(
+        &self,
+        keep: Vec<(String, String)>,
+    ) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            if keep.is_empty() {
+                let mut stmt = Statement::prepare(conn, "DELETE FROM worktree_group_order")?;
+                return stmt.exec();
+            }
+
+            let values_clause = std::iter::repeat("(?, ?)")
+                .take(keep.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "DELETE FROM worktree_group_order \
+                 WHERE (remote_connection_identity, group_path_list) NOT IN \
+                     (VALUES {values_clause})"
+            );
+            let mut stmt = Statement::prepare(conn, sql)?;
+            let mut next_index = 1;
+            for (identity, group_path_list) in &keep {
+                next_index = stmt.bind(identity, next_index)?;
+                next_index = stmt.bind(group_path_list, next_index)?;
+            }
+            stmt.exec()
+        })
+        .await
+    }
+
     /// Upsert metadata for a thread.
     ///
     /// Drafts are persisted with `session_id = None`. They get a real
@@ -2192,6 +2310,26 @@ impl Column for WorktreeOverrideRow {
                 },
                 custom_name,
                 collapsed: collapsed != 0,
+            },
+            next,
+        ))
+    }
+}
+
+impl Column for WorktreeOrderRow {
+    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
+        let (remote_connection_identity, next): (String, i32) =
+            Column::column(statement, start_index)?;
+        let (group_path_list, next): (String, i32) = Column::column(statement, next)?;
+        let (path_str, next): (String, i32) = Column::column(statement, next)?;
+        let (position, next): (i64, i32) = Column::column(statement, next)?;
+
+        Ok((
+            WorktreeOrderRow {
+                remote_connection_identity,
+                group_path_list,
+                worktree_path: PathBuf::from(path_str),
+                position: position.max(0) as u32,
             },
             next,
         ))
