@@ -34,7 +34,9 @@ use menu::{
 };
 use project::{AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId};
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
-use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{
+    RemoteConnectionOptions, remote_connection_identity, same_remote_connection_identity,
+};
 use ui::utils::platform_title_bar_height;
 
 use serde::{Deserialize, Serialize};
@@ -495,6 +497,31 @@ fn primary_worktree_folder_for_thread(
         }
     }
     group_folder_paths.first().cloned()
+}
+
+fn canonical_group_path_list(key: &ProjectGroupKey) -> String {
+    let serialized = key.path_list().serialize();
+    match serde_json::to_string(&serialized) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            log::error!("failed to serialize project group path list: {error}");
+            format!("{:?}", key.path_list())
+        }
+    }
+}
+
+fn remote_connection_identity_for_group(key: &ProjectGroupKey) -> String {
+    let Some(host) = key.host() else {
+        return "local".to_string();
+    };
+    let identity = remote_connection_identity(&host);
+    match serde_json::to_string(&identity) {
+        Ok(identity) => identity,
+        Err(error) => {
+            log::error!("failed to serialize remote connection identity: {error}");
+            format!("{identity:?}")
+        }
+    }
 }
 
 fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
@@ -1200,7 +1227,7 @@ impl Sidebar {
     ///     - If you have no threads, and two workspaces for the worktree and the main workspace, make sure at least one is shown
     /// - Should always show every thread, associated with each workspace in the multiworkspace
     /// - After every build_contents, our "active" state should exactly match the current workspace's, current agent panel's current thread.
-    fn rebuild_contents(&mut self, cx: &App) {
+    fn rebuild_contents(&mut self, cx: &mut Context<Self>) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
@@ -1315,6 +1342,8 @@ impl Sidebar {
             if group_key.path_list().paths().is_empty() {
                 continue;
             }
+            let group_remote_identity = remote_connection_identity_for_group(group_key);
+            let group_canonical_path_list = canonical_group_path_list(group_key);
 
             let label = group_key.display_name(&path_detail_map);
 
@@ -1699,8 +1728,7 @@ impl Sidebar {
                         let project = workspace.read(cx).project().read(cx);
                         for repo in project.repositories(cx).values() {
                             let snapshot = repo.read(cx).snapshot();
-                            let snapshot_folder =
-                                snapshot.work_directory_abs_path.to_path_buf();
+                            let snapshot_folder = snapshot.work_directory_abs_path.to_path_buf();
                             let snapshot_is_linked = snapshot.is_linked_worktree();
                             let snapshot_main_path = if snapshot_is_linked {
                                 snapshot
@@ -1741,8 +1769,7 @@ impl Sidebar {
                                         &linked_path,
                                     )
                                     .unwrap_or_else(|| file_name_or_path_string(&linked_path));
-                                    worktree_name_by_path
-                                        .insert(linked_path.clone(), name);
+                                    worktree_name_by_path.insert(linked_path.clone(), name);
                                     group_folder_paths.push(linked_path);
                                 }
                             }
@@ -1764,8 +1791,28 @@ impl Sidebar {
                 }
 
                 let store = ThreadMetadataStore::global(cx).read(cx);
+                let stored_order = store
+                    .worktree_order_for_group(&group_remote_identity, &group_canonical_path_list);
+                let group_folder_path_set = group_folder_paths
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<PathBuf>>();
+                let mut ordered_group_folder_paths = Vec::with_capacity(group_folder_paths.len());
+                let mut ordered_group_folder_path_set = HashSet::new();
+                for worktree_path in stored_order {
+                    if group_folder_path_set.contains(&worktree_path)
+                        && ordered_group_folder_path_set.insert(worktree_path.clone())
+                    {
+                        ordered_group_folder_paths.push(worktree_path);
+                    }
+                }
                 for worktree_path in &group_folder_paths {
-                    let worktree_path = worktree_path.clone();
+                    if ordered_group_folder_path_set.insert(worktree_path.clone()) {
+                        ordered_group_folder_paths.push(worktree_path.clone());
+                    }
+                }
+
+                for worktree_path in ordered_group_folder_paths {
                     let bucket = threads_by_worktree
                         .remove(&worktree_path)
                         .unwrap_or_default();
