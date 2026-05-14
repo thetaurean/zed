@@ -550,6 +550,7 @@ pub struct ThreadMetadataStore {
     worktree_overrides_loaded: bool,
     dirty_worktree_override_keys: HashSet<WorktreeGroupOverrideKey>,
     dirty_worktree_order_groups: HashSet<WorktreeOrderGroupKey>,
+    pending_worktree_order_cleanup_keep_groups: Option<HashSet<(String, String)>>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -562,6 +563,8 @@ enum DbOperationKey {
     Thread(ThreadId),
     WorktreeOverride(WorktreeGroupOverrideKey),
     WorktreeOverrideCleanup(Option<RemoteConnectionIdentity>),
+    WorktreeOrder(String, String),
+    WorktreeOrderCleanup(Vec<(String, String)>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -575,6 +578,14 @@ enum DbOperation {
     CleanupWorktreeOverrides {
         remote_connection_identity: Option<RemoteConnectionIdentity>,
         keep_paths: Vec<PathBuf>,
+    },
+    SetWorktreeOrder {
+        remote_connection_identity: String,
+        group_path_list_canonical: String,
+        ordered_paths: Vec<PathBuf>,
+    },
+    CleanupWorktreeOrder {
+        keep: Vec<(String, String)>,
     },
 }
 
@@ -590,6 +601,19 @@ impl DbOperation {
                 remote_connection_identity,
                 ..
             } => DbOperationKey::WorktreeOverrideCleanup(remote_connection_identity.clone()),
+            DbOperation::SetWorktreeOrder {
+                remote_connection_identity,
+                group_path_list_canonical,
+                ..
+            } => DbOperationKey::WorktreeOrder(
+                remote_connection_identity.clone(),
+                group_path_list_canonical.clone(),
+            ),
+            DbOperation::CleanupWorktreeOrder { keep } => {
+                let mut keep = keep.clone();
+                keep.sort();
+                DbOperationKey::WorktreeOrderCleanup(keep)
+            }
         }
     }
 }
@@ -849,6 +873,67 @@ impl ThreadMetadataStore {
         self.update_worktree_override(remote_connection, path, None, Some(collapsed), cx);
     }
 
+    pub fn worktree_order_for_group(
+        &self,
+        remote_connection_identity: &str,
+        group_path_list_canonical: &str,
+    ) -> Vec<PathBuf> {
+        let mut entries = self
+            .worktree_order
+            .iter()
+            .filter_map(|(key, position)| {
+                (key.remote_connection_identity == remote_connection_identity
+                    && key.group_path_list_canonical == group_path_list_canonical)
+                    .then(|| (*position, key.worktree_path.clone()))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|(left_position, left_path), (right_position, right_path)| {
+            left_position
+                .cmp(right_position)
+                .then_with(|| left_path.cmp(right_path))
+        });
+        entries.into_iter().map(|(_, path)| path).collect()
+    }
+
+    pub fn set_worktree_order_for_group(
+        &mut self,
+        remote_connection_identity: String,
+        group_path_list_canonical: String,
+        ordered_paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let group_key = WorktreeOrderGroupKey {
+            remote_connection_identity: remote_connection_identity.clone(),
+            group_path_list_canonical: group_path_list_canonical.clone(),
+        };
+        self.dirty_worktree_order_groups.insert(group_key);
+
+        self.worktree_order.retain(|key, _| {
+            !(key.remote_connection_identity == remote_connection_identity
+                && key.group_path_list_canonical == group_path_list_canonical)
+        });
+        for (position, path) in ordered_paths.iter().enumerate() {
+            self.worktree_order.insert(
+                WorktreeOrderKey {
+                    remote_connection_identity: remote_connection_identity.clone(),
+                    group_path_list_canonical: group_path_list_canonical.clone(),
+                    worktree_path: path.clone(),
+                },
+                position as u32,
+            );
+        }
+
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::SetWorktreeOrder {
+                remote_connection_identity,
+                group_path_list_canonical,
+                ordered_paths,
+            })
+            .log_err();
+
+        cx.notify();
+    }
+
     pub fn cleanup_worktree_overrides_not_in(
         &mut self,
         remote_connection: Option<&RemoteConnectionOptions>,
@@ -889,6 +974,61 @@ impl ThreadMetadataStore {
             })
             .log_err();
         cx.notify();
+    }
+
+    pub fn cleanup_worktree_order_not_in_groups(
+        &mut self,
+        keep: &HashSet<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let removed_groups = self
+            .worktree_order
+            .keys()
+            .filter_map(|key| {
+                let group_key = WorktreeOrderGroupKey {
+                    remote_connection_identity: key.remote_connection_identity.clone(),
+                    group_path_list_canonical: key.group_path_list_canonical.clone(),
+                };
+                (!keep.contains(&(
+                    key.remote_connection_identity.clone(),
+                    key.group_path_list_canonical.clone(),
+                )))
+                .then_some(group_key)
+            })
+            .collect::<HashSet<_>>();
+        let should_persist_cleanup = !self.worktree_order_loaded || !removed_groups.is_empty();
+        if !should_persist_cleanup {
+            return;
+        }
+
+        let removed_groups = if removed_groups.is_empty() {
+            None
+        } else {
+            Some(removed_groups)
+        };
+
+        if !self.worktree_order_loaded {
+            match self.pending_worktree_order_cleanup_keep_groups.as_mut() {
+                Some(pending_keep) => pending_keep.retain(|group| keep.contains(group)),
+                None => self.pending_worktree_order_cleanup_keep_groups = Some(keep.clone()),
+            }
+        }
+
+        if let Some(removed_groups) = removed_groups {
+            self.dirty_worktree_order_groups.extend(removed_groups);
+            self.worktree_order.retain(|key, _| {
+                keep.contains(&(
+                    key.remote_connection_identity.clone(),
+                    key.group_path_list_canonical.clone(),
+                ))
+            });
+            cx.notify();
+        }
+
+        let keep = keep.iter().cloned().collect::<Vec<_>>();
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::CleanupWorktreeOrder { keep })
+            .log_err();
     }
 
     fn update_worktree_override(
@@ -1440,6 +1580,26 @@ impl ThreadMetadataStore {
                                 .context("delete stale worktree group overrides")
                                 .log_err();
                             }
+                            DbOperation::SetWorktreeOrder {
+                                remote_connection_identity,
+                                group_path_list_canonical,
+                                ordered_paths,
+                            } => {
+                                db.upsert_worktree_order_entries(
+                                    remote_connection_identity,
+                                    group_path_list_canonical,
+                                    ordered_paths,
+                                )
+                                .await
+                                .context("persist worktree group order")
+                                .log_err();
+                            }
+                            DbOperation::CleanupWorktreeOrder { keep } => {
+                                db.delete_worktree_order_not_in_groups(keep)
+                                    .await
+                                    .context("delete stale worktree group order")
+                                    .log_err();
+                            }
                         }
                     }
                 }
@@ -1501,6 +1661,14 @@ impl ThreadMetadataStore {
                     if this.dirty_worktree_order_groups.contains(&group_key) {
                         continue;
                     }
+                    if let Some(keep_groups) = &this.pending_worktree_order_cleanup_keep_groups
+                        && !keep_groups.contains(&(
+                            row.remote_connection_identity.clone(),
+                            row.group_path_list.clone(),
+                        ))
+                    {
+                        continue;
+                    }
 
                     let key = WorktreeOrderKey {
                         remote_connection_identity: row.remote_connection_identity,
@@ -1510,6 +1678,7 @@ impl ThreadMetadataStore {
                     this.worktree_order.insert(key, row.position);
                 }
                 this.worktree_order_loaded = true;
+                this.pending_worktree_order_cleanup_keep_groups = None;
                 cx.notify();
             })
             .ok();
@@ -1528,6 +1697,7 @@ impl ThreadMetadataStore {
             worktree_overrides_loaded: false,
             dirty_worktree_override_keys: HashSet::default(),
             dirty_worktree_order_groups: HashSet::default(),
+            pending_worktree_order_cleanup_keep_groups: None,
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1918,7 +2088,6 @@ impl ThreadMetadataDb {
         .await
     }
 
-    #[allow(dead_code)]
     async fn upsert_worktree_order_entries(
         &self,
         remote_connection_identity: String,
@@ -1965,26 +2134,6 @@ impl ThreadMetadataDb {
         .await
     }
 
-    #[allow(dead_code)]
-    async fn delete_worktree_order_for_group(
-        &self,
-        remote_connection_identity: String,
-        group_path_list: String,
-    ) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM worktree_group_order \
-                 WHERE remote_connection_identity = ?1 AND group_path_list = ?2",
-            )?;
-            let next_index = stmt.bind(&remote_connection_identity, 1)?;
-            stmt.bind(&group_path_list, next_index)?;
-            stmt.exec()
-        })
-        .await
-    }
-
-    #[allow(dead_code)]
     async fn delete_worktree_order_not_in_groups(
         &self,
         keep: Vec<(String, String)>,
@@ -3659,6 +3808,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dedup_db_operations_keeps_latest_worktree_order() {
+        let deduped = ThreadMetadataStore::dedup_db_operations(vec![
+            DbOperation::SetWorktreeOrder {
+                remote_connection_identity: "local".to_string(),
+                group_path_list_canonical: "/project".to_string(),
+                ordered_paths: vec![PathBuf::from("/project/a"), PathBuf::from("/project/b")],
+            },
+            DbOperation::SetWorktreeOrder {
+                remote_connection_identity: "local".to_string(),
+                group_path_list_canonical: "/project".to_string(),
+                ordered_paths: vec![PathBuf::from("/project/b"), PathBuf::from("/project/a")],
+            },
+        ]);
+
+        assert_eq!(
+            deduped,
+            vec![DbOperation::SetWorktreeOrder {
+                remote_connection_identity: "local".to_string(),
+                group_path_list_canonical: "/project".to_string(),
+                ordered_paths: vec![PathBuf::from("/project/b"), PathBuf::from("/project/a")],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_dedup_db_operations_preserves_different_worktree_order_cleanups() {
+        let deduped = ThreadMetadataStore::dedup_db_operations(vec![
+            DbOperation::SetWorktreeOrder {
+                remote_connection_identity: "local".to_string(),
+                group_path_list_canonical: "B".to_string(),
+                ordered_paths: vec![PathBuf::from("/b")],
+            },
+            DbOperation::CleanupWorktreeOrder {
+                keep: vec![("local".to_string(), "A".to_string())],
+            },
+            DbOperation::CleanupWorktreeOrder {
+                keep: vec![
+                    ("local".to_string(), "A".to_string()),
+                    ("local".to_string(), "B".to_string()),
+                ],
+            },
+        ]);
+
+        assert_eq!(
+            deduped,
+            vec![
+                DbOperation::SetWorktreeOrder {
+                    remote_connection_identity: "local".to_string(),
+                    group_path_list_canonical: "B".to_string(),
+                    ordered_paths: vec![PathBuf::from("/b")],
+                },
+                DbOperation::CleanupWorktreeOrder {
+                    keep: vec![("local".to_string(), "A".to_string())],
+                },
+                DbOperation::CleanupWorktreeOrder {
+                    keep: vec![
+                        ("local".to_string(), "A".to_string()),
+                        ("local".to_string(), "B".to_string()),
+                    ],
+                },
+            ]
+        );
+    }
+
     #[gpui::test]
     async fn test_archive_and_unarchive_thread(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4984,6 +5198,208 @@ mod tests {
                 &[std::path::PathBuf::from("/project-a")],
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod worktree_order_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn key(group: &str, path: &str) -> (String, String, PathBuf) {
+        ("local".to_string(), group.to_string(), PathBuf::from(path))
+    }
+
+    #[gpui::test]
+    async fn test_set_and_read_worktree_order(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            ThreadMetadataStore::init_global(cx);
+        });
+
+        let (identity, group, a) = key("/proj-root", "/proj-root/a");
+        let (_, _, b) = key("/proj-root", "/proj-root/b");
+        let (_, _, c) = key("/proj-root", "/proj-root/c");
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_worktree_order_for_group(
+                    identity.clone(),
+                    group.clone(),
+                    vec![c.clone(), a.clone(), b.clone()],
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            let order = store.worktree_order_for_group(&identity, &group);
+            assert_eq!(order, vec![c.clone(), a.clone(), b.clone()]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_repeated_set_persists_latest_worktree_order(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            ThreadMetadataStore::init_global(cx);
+        });
+
+        let (identity, group, a) = key("/repeated-set", "/repeated-set/a");
+        let (_, _, b) = key("/repeated-set", "/repeated-set/b");
+        let db = cx.update(|cx| ThreadMetadataStore::global(cx).read(cx).db.clone());
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_worktree_order_for_group(
+                    identity.clone(),
+                    group.clone(),
+                    vec![a.clone(), b.clone()],
+                    cx,
+                );
+                store.set_worktree_order_for_group(
+                    identity.clone(),
+                    group.clone(),
+                    vec![b.clone(), a.clone()],
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let rows = db.load_worktree_order().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].worktree_path, b);
+        assert_eq!(rows[0].position, 0);
+        assert_eq!(rows[1].worktree_path, a);
+        assert_eq!(rows[1].position, 1);
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_removes_orphan_groups(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            ThreadMetadataStore::init_global(cx);
+        });
+
+        let (identity, keep_group, p1) = key("/keep", "/keep/p1");
+        let (_, drop_group, p2) = key("/drop", "/drop/p2");
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_worktree_order_for_group(
+                    identity.clone(),
+                    keep_group.clone(),
+                    vec![p1.clone()],
+                    cx,
+                );
+                store.set_worktree_order_for_group(
+                    identity.clone(),
+                    drop_group.clone(),
+                    vec![p2.clone()],
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                let mut keep = HashSet::default();
+                keep.insert((identity.clone(), keep_group.clone()));
+                store.cleanup_worktree_order_not_in_groups(&keep, cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store.worktree_order_for_group(&identity, &keep_group),
+                vec![p1.clone()]
+            );
+            assert!(
+                store
+                    .worktree_order_for_group(&identity, &drop_group)
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_before_load_prunes_db_only_orphan_groups(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            ThreadMetadataStore::init_global(cx);
+        });
+
+        let (identity, keep_group, p1) = key("/keep-before-load", "/keep-before-load/p1");
+        let (_, drop_group, p2) = key("/drop-before-load", "/drop-before-load/p2");
+        let db = cx.update(|cx| ThreadMetadataStore::global(cx).read(cx).db.clone());
+        db.upsert_worktree_order_entries(identity.clone(), keep_group.clone(), vec![p1.clone()])
+            .await
+            .unwrap();
+        db.upsert_worktree_order_entries(identity.clone(), drop_group.clone(), vec![p2])
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.worktree_order.clear();
+                store.worktree_order_loaded = false;
+
+                let mut keep = HashSet::default();
+                keep.insert((identity.clone(), keep_group.clone()));
+                store.cleanup_worktree_order_not_in_groups(&keep, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let rows = db.load_worktree_order().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].remote_connection_identity, identity);
+        assert_eq!(rows[0].group_path_list, keep_group);
+        assert_eq!(rows[0].worktree_path, p1);
+    }
+
+    #[gpui::test]
+    async fn test_pre_load_cleanup_keep_sets_are_cumulative(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            ThreadMetadataStore::init_global(cx);
+        });
+
+        let (identity, group_a, _) = key("/pending-a", "/pending-a/p1");
+        let (_, group_b, _) = key("/pending-b", "/pending-b/p1");
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.worktree_order.clear();
+                store.worktree_order_loaded = false;
+
+                let mut keep_a = HashSet::default();
+                keep_a.insert((identity.clone(), group_a.clone()));
+                store.cleanup_worktree_order_not_in_groups(&keep_a, cx);
+
+                let mut keep_a_and_b = HashSet::default();
+                keep_a_and_b.insert((identity.clone(), group_a.clone()));
+                keep_a_and_b.insert((identity.clone(), group_b.clone()));
+                store.cleanup_worktree_order_not_in_groups(&keep_a_and_b, cx);
+
+                let pending_keep = store
+                    .pending_worktree_order_cleanup_keep_groups
+                    .as_ref()
+                    .expect("pre-load cleanup should leave a pending keep filter");
+                assert_eq!(pending_keep.len(), 1);
+                assert!(pending_keep.contains(&(identity.clone(), group_a.clone())));
+            });
         });
     }
 }
