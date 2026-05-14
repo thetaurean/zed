@@ -1691,6 +1691,15 @@ impl Domain for ThreadMetadataDb {
                 PRIMARY KEY(remote_connection_identity, worktree_path)
             ) STRICT;
         ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS worktree_group_order(
+                remote_connection_identity TEXT NOT NULL,
+                group_path_list TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY(remote_connection_identity, group_path_list, worktree_path)
+            ) STRICT;
+        ),
     ];
 }
 
