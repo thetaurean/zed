@@ -2,12 +2,13 @@ use std::ops::Range;
 
 use editor::Editor;
 use gpui::{
-    AnyElement, AppContext, Entity, IntoElement, ParentElement, Styled, Subscription, Window, div,
+    Action, AnyElement, AppContext, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
+    Styled, Subscription, Window, div,
 };
 use markdown::Markdown;
 use ui::{
-    ActiveTheme, ButtonCommon, Color, IconButton, IconButtonShape, IconName, IconSize, Label,
-    LabelCommon, LabelSize, Toggleable, Tooltip, h_flex,
+    ActiveTheme, ButtonCommon, Clickable, Color, IconButton, IconButtonShape, IconName, IconSize,
+    Label, LabelCommon, LabelSize, Toggleable, Tooltip, h_flex,
 };
 
 #[derive(Default, Clone, Copy)]
@@ -47,6 +48,24 @@ impl ThreadSearch {
 
     pub fn query(&self, cx: &gpui::App) -> String {
         self.query_editor.read(cx).text(cx)
+    }
+
+    pub fn deploy(&mut self, window: &mut Window, cx: &mut gpui::App) {
+        self.dismissed = false;
+        self.query_editor.update(cx, |editor, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+        });
+    }
+
+    pub fn dismiss(&mut self, _window: &mut Window, _cx: &mut gpui::App) {
+        self.dismissed = true;
+        self.matches.clear();
+        self.active_match_index = None;
+    }
+
+    pub fn query_editor_focus_handle(&self, cx: &gpui::App) -> FocusHandle {
+        self.query_editor.read(cx).focus_handle(cx)
     }
 
     pub fn render(&self, cx: &mut gpui::App) -> Option<AnyElement> {
@@ -94,6 +113,9 @@ impl ThreadSearch {
                     IconButton::new("thread-search-close", IconName::Close)
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(crate::ToggleSearch.boxed_clone(), cx);
+                        })
                         .tooltip(Tooltip::text("Close Search")),
                 )
                 .into_any_element(),

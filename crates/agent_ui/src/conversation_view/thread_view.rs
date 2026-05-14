@@ -1,5 +1,5 @@
 use crate::{
-    DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
+    DEFAULT_THREAD_TITLE, SelectPermissionGranularity, ToggleSearch,
     agent_configuration::configure_context_server_modal::default_markdown_style,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
@@ -1613,6 +1613,16 @@ impl ThreadView {
         });
 
         self.send_content(contents_task, window, cx);
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.thread_search.dismissed {
+            self.thread_search.deploy(window, cx);
+        } else {
+            self.thread_search.dismiss(window, cx);
+            self.message_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
     }
 
     pub fn move_queued_message_to_main_editor(
@@ -9148,6 +9158,9 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(|this, _: &ToggleSearch, window, cx| {
+                this.toggle_search(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleFastMode, _window, cx| {
                 this.toggle_fast_mode(cx);
             }))
