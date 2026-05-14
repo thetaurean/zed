@@ -1687,6 +1687,20 @@ impl ThreadView {
         }
     }
 
+    fn toggle_search_include_tool_calls(
+        &mut self,
+        _: &crate::ToggleSearchIncludeToolCalls,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.include_tool_calls = !self.thread_search.include_tool_calls;
+        self.refresh_thread_search(cx);
+    }
+
     fn advance_thread_search(&mut self, delta: isize, cx: &mut Context<Self>) {
         let active_entry_index = self.thread_search.step_active(delta);
         self.thread_search.apply_highlights(cx);
@@ -9239,6 +9253,7 @@ impl Render for ThreadView {
             }))
             .on_action(cx.listener(Self::thread_search_select_next))
             .on_action(cx.listener(Self::thread_search_select_prev))
+            .on_action(cx.listener(Self::toggle_search_include_tool_calls))
             .on_action(cx.listener(|this, _: &ToggleFastMode, _window, cx| {
                 this.toggle_fast_mode(cx);
             }))

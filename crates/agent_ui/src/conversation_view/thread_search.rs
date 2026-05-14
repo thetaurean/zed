@@ -201,6 +201,10 @@ impl ThreadSearch {
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         .toggle_state(self.include_tool_calls)
+                        .on_click(|_, window, cx| {
+                            window
+                                .dispatch_action(Box::new(crate::ToggleSearchIncludeToolCalls), cx);
+                        })
                         .tooltip(Tooltip::text("Include Tool Calls")),
                 )
                 .child(

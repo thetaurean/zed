@@ -220,6 +220,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Toggles the in-panel search bar for the active thread.
         ToggleSearch,
+        /// Toggles whether thread search includes tool call titles and outputs.
+        ToggleSearchIncludeToolCalls,
     ]
 );
 
