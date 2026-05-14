@@ -106,6 +106,26 @@ impl ThreadSearch {
         }
     }
 
+    pub fn step_active(&mut self, delta: isize) -> Option<usize> {
+        if self.matches.is_empty() {
+            self.active_match_index = None;
+            return None;
+        }
+
+        let match_count = self.matches.len();
+        let current_match_index = self
+            .active_match_index
+            .filter(|index| *index < match_count)
+            .unwrap_or(0);
+        let next_match_index =
+            (current_match_index as isize + delta).rem_euclid(match_count as isize) as usize;
+
+        self.active_match_index = Some(next_match_index);
+        self.matches
+            .get(next_match_index)
+            .map(|search_match| search_match.entry_index)
+    }
+
     pub fn clear_highlights(&self, cx: &mut gpui::App) {
         let mut cleared_markdowns = HashSet::<Entity<Markdown>>::new();
 
@@ -162,12 +182,18 @@ impl ThreadSearch {
                     IconButton::new("thread-search-prev", IconName::ChevronUp)
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::SelectPrevious.boxed_clone(), cx);
+                        })
                         .tooltip(Tooltip::text("Previous Match")),
                 )
                 .child(
                     IconButton::new("thread-search-next", IconName::ChevronDown)
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::SelectNext.boxed_clone(), cx);
+                        })
                         .tooltip(Tooltip::text("Next Match")),
                 )
                 .child(
@@ -423,5 +449,90 @@ mod tests {
         assert_eq!(format_match_counter(None, 0), "0/0");
         assert_eq!(format_match_counter(Some(0), 3), "1/3");
         assert_eq!(format_match_counter(Some(2), 3), "3/3");
+    }
+
+    #[gpui::test]
+    fn step_active_wraps_through_matches(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let markdown = cx.new(|cx| Markdown::new("one two three".into(), None, None, cx));
+        let query_editor = Rc::new(RefCell::new(None));
+        cx.add_window({
+            let query_editor = query_editor.clone();
+            move |window, cx| {
+                let editor = cx.new(|cx| Editor::single_line(window, cx));
+                *query_editor.borrow_mut() = Some(editor);
+                TestWindow
+            }
+        });
+        let query_editor = match query_editor.borrow().clone() {
+            Some(query_editor) => query_editor,
+            None => panic!("test window should create query editor"),
+        };
+        let mut thread_search = ThreadSearch {
+            query_editor,
+            dismissed: false,
+            include_tool_calls: false,
+            options: SearchOptions::default(),
+            matches: vec![
+                SearchMatch {
+                    entry_index: 1,
+                    markdown: markdown.clone(),
+                    range: 0..3,
+                },
+                SearchMatch {
+                    entry_index: 4,
+                    markdown: markdown.clone(),
+                    range: 4..7,
+                },
+                SearchMatch {
+                    entry_index: 9,
+                    markdown,
+                    range: 8..13,
+                },
+            ],
+            active_match_index: Some(0),
+            _subscriptions: Vec::new(),
+        };
+
+        assert_eq!(thread_search.step_active(1), Some(4));
+        assert_eq!(thread_search.active_match_index, Some(1));
+        assert_eq!(thread_search.step_active(1), Some(9));
+        assert_eq!(thread_search.active_match_index, Some(2));
+        assert_eq!(thread_search.step_active(1), Some(1));
+        assert_eq!(thread_search.active_match_index, Some(0));
+        assert_eq!(thread_search.step_active(-1), Some(9));
+        assert_eq!(thread_search.active_match_index, Some(2));
+    }
+
+    #[gpui::test]
+    fn step_active_clears_active_when_empty(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let query_editor = Rc::new(RefCell::new(None));
+        cx.add_window({
+            let query_editor = query_editor.clone();
+            move |window, cx| {
+                let editor = cx.new(|cx| Editor::single_line(window, cx));
+                *query_editor.borrow_mut() = Some(editor);
+                TestWindow
+            }
+        });
+        let query_editor = match query_editor.borrow().clone() {
+            Some(query_editor) => query_editor,
+            None => panic!("test window should create query editor"),
+        };
+        let mut thread_search = ThreadSearch {
+            query_editor,
+            dismissed: false,
+            include_tool_calls: false,
+            options: SearchOptions::default(),
+            matches: Vec::new(),
+            active_match_index: Some(2),
+            _subscriptions: Vec::new(),
+        };
+
+        assert_eq!(thread_search.step_active(1), None);
+        assert_eq!(thread_search.active_match_index, None);
     }
 }

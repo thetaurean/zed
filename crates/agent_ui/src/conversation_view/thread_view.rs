@@ -1665,6 +1665,42 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn thread_search_select_next(
+        &mut self,
+        _: &menu::SelectNext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.thread_search.dismissed {
+            self.advance_thread_search(1, cx);
+        }
+    }
+
+    fn thread_search_select_prev(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.thread_search.dismissed {
+            self.advance_thread_search(-1, cx);
+        }
+    }
+
+    fn advance_thread_search(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let active_entry_index = self.thread_search.step_active(delta);
+        self.thread_search.apply_highlights(cx);
+
+        if let Some(entry_index) = active_entry_index {
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix: entry_index,
+                offset_in_item: gpui::px(0.0),
+            });
+        }
+
+        cx.notify();
+    }
+
     pub fn move_queued_message_to_main_editor(
         &mut self,
         index: usize,
@@ -9201,6 +9237,8 @@ impl Render for ThreadView {
             .on_action(cx.listener(|this, _: &ToggleSearch, window, cx| {
                 this.toggle_search(window, cx);
             }))
+            .on_action(cx.listener(Self::thread_search_select_next))
+            .on_action(cx.listener(Self::thread_search_select_prev))
             .on_action(cx.listener(|this, _: &ToggleFastMode, _window, cx| {
                 this.toggle_fast_mode(cx);
             }))
