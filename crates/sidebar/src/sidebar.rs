@@ -476,6 +476,12 @@ fn classify_worktree_git_status(
     }
 }
 
+fn file_name_or_path_string(path: &Path) -> SharedString {
+    path.file_name()
+        .map(|name| SharedString::from(name.to_string_lossy().to_string()))
+        .unwrap_or_else(|| SharedString::from(path.to_string_lossy().to_string()))
+}
+
 fn primary_worktree_folder_for_thread(
     thread_folder_paths: &PathList,
     group_folder_paths: &[PathBuf],
@@ -1678,20 +1684,65 @@ impl Sidebar {
                 // are keyed off folder paths so each linked worktree gets its
                 // own row — `group_key.path_list()` only has main paths, which
                 // collapses every linked worktree onto the parent repo.
+                //
+                // Worktree short names follow the same convention as
+                // `workspace_menu_worktree_labels`: "main" for the main worktree,
+                // `linked_worktree_short_name(main, folder)` for linked ones.
+                // Using the folder's `file_name()` would render the repo name
+                // for both (because Zed's typical linked-worktree layout nests
+                // a same-named project dir under a branch-named parent).
                 let mut group_folder_paths: Vec<PathBuf> = Vec::new();
+                let mut worktree_name_by_path: HashMap<PathBuf, SharedString> = HashMap::new();
                 {
                     let mut seen: HashSet<PathBuf> = HashSet::new();
                     for workspace in group_workspaces {
                         let project = workspace.read(cx).project().read(cx);
                         for repo in project.repositories(cx).values() {
                             let snapshot = repo.read(cx).snapshot();
-                            let main_path = snapshot.work_directory_abs_path.to_path_buf();
-                            if seen.insert(main_path.clone()) {
-                                group_folder_paths.push(main_path);
+                            let snapshot_folder =
+                                snapshot.work_directory_abs_path.to_path_buf();
+                            let snapshot_is_linked = snapshot.is_linked_worktree();
+                            let snapshot_main_path = if snapshot_is_linked {
+                                snapshot
+                                    .main_worktree_abs_path()
+                                    .map(|path| path.to_path_buf())
+                            } else {
+                                None
+                            };
+
+                            if seen.insert(snapshot_folder.clone()) {
+                                let name = if snapshot_is_linked {
+                                    snapshot_main_path
+                                        .as_deref()
+                                        .and_then(|main| {
+                                            project::linked_worktree_short_name(
+                                                main,
+                                                &snapshot_folder,
+                                            )
+                                        })
+                                        .unwrap_or_else(|| {
+                                            file_name_or_path_string(&snapshot_folder)
+                                        })
+                                } else {
+                                    SharedString::new_static("main")
+                                };
+                                worktree_name_by_path.insert(snapshot_folder.clone(), name);
+                                group_folder_paths.push(snapshot_folder.clone());
                             }
+
+                            let linked_owner_main = snapshot_main_path
+                                .clone()
+                                .unwrap_or_else(|| snapshot_folder.clone());
                             for linked_wt in snapshot.linked_worktrees() {
                                 let linked_path = linked_wt.path.clone();
                                 if seen.insert(linked_path.clone()) {
+                                    let name = project::linked_worktree_short_name(
+                                        &linked_owner_main,
+                                        &linked_path,
+                                    )
+                                    .unwrap_or_else(|| file_name_or_path_string(&linked_path));
+                                    worktree_name_by_path
+                                        .insert(linked_path.clone(), name);
                                     group_folder_paths.push(linked_path);
                                 }
                             }
@@ -1730,12 +1781,10 @@ impl Sidebar {
                         .as_ref()
                         .is_some_and(|override_entry| override_entry.collapsed);
 
-                    let derived_name = worktree_path
-                        .file_name()
-                        .map(|name| SharedString::from(name.to_string_lossy().to_string()))
-                        .unwrap_or_else(|| {
-                            SharedString::from(worktree_path.to_string_lossy().to_string())
-                        });
+                    let derived_name = worktree_name_by_path
+                        .get(&worktree_path)
+                        .cloned()
+                        .unwrap_or_else(|| file_name_or_path_string(&worktree_path));
                     let display_name = custom_name.clone().unwrap_or(derived_name);
                     let branch_name = branch_by_path.get(&worktree_path).cloned();
                     let git_status = git_status_by_path
