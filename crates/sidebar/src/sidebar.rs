@@ -476,23 +476,19 @@ fn classify_worktree_git_status(
     }
 }
 
-fn primary_worktree_path_for_thread(
-    thread_main_paths: &PathList,
-    group_paths: &PathList,
+fn primary_worktree_folder_for_thread(
+    thread_folder_paths: &PathList,
+    group_folder_paths: &[PathBuf],
 ) -> Option<PathBuf> {
-    for thread_path in thread_main_paths.ordered_paths() {
-        if group_paths
-            .paths()
+    for thread_path in thread_folder_paths.ordered_paths() {
+        if group_folder_paths
             .iter()
             .any(|group_path| group_path.as_path() == thread_path.as_path())
         {
             return Some(thread_path.to_path_buf());
         }
     }
-    group_paths
-        .ordered_paths()
-        .next()
-        .map(|path| path.to_path_buf())
+    group_folder_paths.first().cloned()
 }
 
 fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
@@ -1677,12 +1673,37 @@ impl Sidebar {
                     entries.push(ListEntry::Terminal(terminal));
                 }
 
-                let group_paths = group_key.path_list();
+                // Collect folder paths (actual worktree locations, including
+                // linked worktrees) for this group. Subheaders + thread buckets
+                // are keyed off folder paths so each linked worktree gets its
+                // own row — `group_key.path_list()` only has main paths, which
+                // collapses every linked worktree onto the parent repo.
+                let mut group_folder_paths: Vec<PathBuf> = Vec::new();
+                {
+                    let mut seen: HashSet<PathBuf> = HashSet::new();
+                    for workspace in group_workspaces {
+                        let project = workspace.read(cx).project().read(cx);
+                        for repo in project.repositories(cx).values() {
+                            let snapshot = repo.read(cx).snapshot();
+                            let main_path = snapshot.work_directory_abs_path.to_path_buf();
+                            if seen.insert(main_path.clone()) {
+                                group_folder_paths.push(main_path);
+                            }
+                            for linked_wt in snapshot.linked_worktrees() {
+                                let linked_path = linked_wt.path.clone();
+                                if seen.insert(linked_path.clone()) {
+                                    group_folder_paths.push(linked_path);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut threads_by_worktree: HashMap<PathBuf, Vec<ThreadEntry>> = HashMap::new();
                 for thread in threads {
-                    if let Some(primary_path) = primary_worktree_path_for_thread(
-                        thread.metadata.main_worktree_paths(),
-                        group_paths,
+                    if let Some(primary_path) = primary_worktree_folder_for_thread(
+                        thread.metadata.folder_paths(),
+                        &group_folder_paths,
                     ) {
                         threads_by_worktree
                             .entry(primary_path)
@@ -1692,8 +1713,8 @@ impl Sidebar {
                 }
 
                 let store = ThreadMetadataStore::global(cx).read(cx);
-                for worktree_path in group_paths.ordered_paths() {
-                    let worktree_path = worktree_path.to_path_buf();
+                for worktree_path in &group_folder_paths {
+                    let worktree_path = worktree_path.clone();
                     let bucket = threads_by_worktree
                         .remove(&worktree_path)
                         .unwrap_or_default();
