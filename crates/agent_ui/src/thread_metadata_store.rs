@@ -23,7 +23,10 @@ use futures::{FutureExt, future::Shared};
 use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
-use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{
+    RemoteConnectionIdentity, RemoteConnectionOptions, remote_connection_identity,
+    same_remote_connection_identity,
+};
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
@@ -480,6 +483,33 @@ pub struct ArchivedGitWorktree {
     pub original_commit_hash: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeGroupOverride {
+    pub custom_name: Option<SharedString>,
+    pub collapsed: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct WorktreeGroupOverrideKey {
+    remote_connection_identity: Option<RemoteConnectionIdentity>,
+    path: PathBuf,
+}
+
+impl WorktreeGroupOverrideKey {
+    fn new(path: PathBuf, remote_connection: Option<&RemoteConnectionOptions>) -> Self {
+        Self {
+            remote_connection_identity: remote_connection.map(remote_connection_identity),
+            path,
+        }
+    }
+}
+
+struct WorktreeOverrideRow {
+    key: WorktreeGroupOverrideKey,
+    custom_name: Option<String>,
+    collapsed: bool,
+}
+
 /// The store holds all metadata needed to show threads in the sidebar/the archive.
 ///
 /// Listens to ConversationView events and updates metadata when the root thread changes.
@@ -489,6 +519,9 @@ pub struct ThreadMetadataStore {
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
+    worktree_overrides: HashMap<WorktreeGroupOverrideKey, WorktreeGroupOverride>,
+    worktree_overrides_loaded: bool,
+    dirty_worktree_override_keys: HashSet<WorktreeGroupOverrideKey>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -496,17 +529,39 @@ pub struct ThreadMetadataStore {
     _db_operations_task: Task<()>,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum DbOperationKey {
+    Thread(ThreadId),
+    WorktreeOverride(WorktreeGroupOverrideKey),
+    WorktreeOverrideCleanup(Option<RemoteConnectionIdentity>),
+}
+
 #[derive(Debug, PartialEq)]
 enum DbOperation {
     Upsert(ThreadMetadata),
     Delete(ThreadId),
+    SetWorktreeOverride {
+        key: WorktreeGroupOverrideKey,
+        override_: Option<WorktreeGroupOverride>,
+    },
+    CleanupWorktreeOverrides {
+        remote_connection_identity: Option<RemoteConnectionIdentity>,
+        keep_paths: Vec<PathBuf>,
+    },
 }
 
 impl DbOperation {
-    fn id(&self) -> ThreadId {
+    fn key(&self) -> DbOperationKey {
         match self {
-            DbOperation::Upsert(thread) => thread.thread_id,
-            DbOperation::Delete(thread_id) => *thread_id,
+            DbOperation::Upsert(thread) => DbOperationKey::Thread(thread.thread_id),
+            DbOperation::Delete(thread_id) => DbOperationKey::Thread(*thread_id),
+            DbOperation::SetWorktreeOverride { key, .. } => {
+                DbOperationKey::WorktreeOverride(key.clone())
+            }
+            DbOperation::CleanupWorktreeOverrides {
+                remote_connection_identity,
+                ..
+            } => DbOperationKey::WorktreeOverrideCleanup(remote_connection_identity.clone()),
         }
     }
 }
@@ -700,6 +755,170 @@ impl ThreadMetadataStore {
             ..existing.clone()
         };
         self.save(metadata, cx);
+    }
+
+    pub fn worktree_override(
+        &self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        path: &Path,
+    ) -> Option<&WorktreeGroupOverride> {
+        self.worktree_overrides.get(&WorktreeGroupOverrideKey::new(
+            path.to_path_buf(),
+            remote_connection,
+        ))
+    }
+
+    pub fn worktree_custom_name(
+        &self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        path: &Path,
+    ) -> Option<SharedString> {
+        self.worktree_override(remote_connection, path)
+            .and_then(|override_| override_.custom_name.clone())
+    }
+
+    pub fn is_worktree_collapsed(
+        &self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        path: &Path,
+    ) -> bool {
+        self.worktree_override(remote_connection, path)
+            .is_some_and(|override_| override_.collapsed)
+    }
+
+    pub fn set_worktree_custom_name(
+        &mut self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        path: PathBuf,
+        name: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let name = name.as_ref().trim();
+        let custom_name = if name.is_empty() {
+            None
+        } else {
+            Some(SharedString::from(name.to_string()))
+        };
+        self.update_worktree_override(remote_connection, path, Some(custom_name), None, cx);
+    }
+
+    pub fn clear_worktree_custom_name(
+        &mut self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_worktree_override(remote_connection, path.to_path_buf(), Some(None), None, cx);
+    }
+
+    pub fn set_worktree_collapsed(
+        &mut self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        path: PathBuf,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_worktree_override(remote_connection, path, None, Some(collapsed), cx);
+    }
+
+    pub fn cleanup_worktree_overrides_not_in(
+        &mut self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        keep_paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let remote_connection_identity = remote_connection.map(remote_connection_identity);
+        let keep_path_set: HashSet<WorktreeGroupOverrideKey> = keep_paths
+            .iter()
+            .cloned()
+            .map(|path| WorktreeGroupOverrideKey {
+                remote_connection_identity: remote_connection_identity.clone(),
+                path,
+            })
+            .collect();
+        let removed_keys = self
+            .worktree_overrides
+            .keys()
+            .filter(|key| {
+                key.remote_connection_identity == remote_connection_identity
+                    && !keep_path_set.contains(*key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed_keys.is_empty() {
+            return;
+        }
+
+        for key in removed_keys {
+            self.dirty_worktree_override_keys.insert(key.clone());
+            self.worktree_overrides.remove(&key);
+        }
+
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::CleanupWorktreeOverrides {
+                remote_connection_identity,
+                keep_paths,
+            })
+            .log_err();
+        cx.notify();
+    }
+
+    fn update_worktree_override(
+        &mut self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        path: PathBuf,
+        custom_name: Option<Option<SharedString>>,
+        collapsed: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = WorktreeGroupOverrideKey::new(path, remote_connection);
+        let mut override_ = self
+            .worktree_overrides
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(custom_name) = custom_name {
+            override_.custom_name = custom_name;
+        }
+        if let Some(collapsed) = collapsed {
+            override_.collapsed = collapsed;
+        }
+
+        let override_ = if override_.custom_name.is_none() && !override_.collapsed {
+            None
+        } else {
+            Some(override_)
+        };
+
+        if self.worktree_overrides_loaded && self.worktree_overrides.get(&key) == override_.as_ref()
+        {
+            return;
+        }
+
+        self.dirty_worktree_override_keys.insert(key.clone());
+
+        match override_.as_ref() {
+            Some(override_) => {
+                self.worktree_overrides
+                    .insert(key.clone(), override_.clone());
+            }
+            None => {
+                self.worktree_overrides.remove(&key);
+            }
+        }
+
+        self.persist_worktree_override(key, override_);
+        cx.notify();
+    }
+
+    fn persist_worktree_override(
+        &self,
+        key: WorktreeGroupOverrideKey,
+        override_: Option<WorktreeGroupOverride>,
+    ) {
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::SetWorktreeOverride { key, override_ })
+            .log_err();
     }
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
@@ -1164,11 +1383,73 @@ impl ThreadMetadataStore {
                             DbOperation::Delete(thread_id) => {
                                 db.delete(thread_id).await.log_err();
                             }
+                            DbOperation::SetWorktreeOverride { key, override_ } => {
+                                let result = match override_ {
+                                    Some(override_) => db
+                                        .upsert_worktree_override(
+                                            key,
+                                            override_.custom_name.map(|name| name.to_string()),
+                                            override_.collapsed,
+                                        )
+                                        .await
+                                        .context("persist worktree group override"),
+                                    None => db
+                                        .delete_worktree_override(key)
+                                        .await
+                                        .context("delete worktree group override"),
+                                };
+                                result.log_err();
+                            }
+                            DbOperation::CleanupWorktreeOverrides {
+                                remote_connection_identity,
+                                keep_paths,
+                            } => {
+                                db.delete_worktree_overrides_not_in(
+                                    remote_connection_identity,
+                                    keep_paths,
+                                )
+                                .await
+                                .context("delete stale worktree group overrides")
+                                .log_err();
+                            }
                         }
                     }
                 }
             }
         });
+
+        let load_worktree_overrides_task = cx.background_spawn({
+            let db = db.clone();
+            async move {
+                db.load_worktree_overrides()
+                    .await
+                    .context("Failed to fetch worktree group overrides")
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let Some(rows) = load_worktree_overrides_task.await.log_err() else {
+                return;
+            };
+
+            this.update(cx, |this, cx| {
+                for row in rows {
+                    if this.dirty_worktree_override_keys.contains(&row.key) {
+                        continue;
+                    }
+                    this.worktree_overrides.insert(
+                        row.key,
+                        WorktreeGroupOverride {
+                            custom_name: row.custom_name.map(SharedString::from),
+                            collapsed: row.collapsed,
+                        },
+                    );
+                }
+                this.worktree_overrides_loaded = true;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
 
         let mut this = Self {
             db,
@@ -1176,6 +1457,9 @@ impl ThreadMetadataStore {
             threads_by_paths: HashMap::default(),
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
+            worktree_overrides: HashMap::default(),
+            worktree_overrides_loaded: false,
+            dirty_worktree_override_keys: HashSet::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1187,14 +1471,15 @@ impl ThreadMetadataStore {
     }
 
     fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
-        let mut ops = HashMap::default();
+        let mut seen = HashSet::default();
+        let mut deduped = Vec::new();
         for operation in operations.into_iter().rev() {
-            if ops.contains_key(&operation.id()) {
-                continue;
+            if seen.insert(operation.key()) {
+                deduped.push(operation);
             }
-            ops.insert(operation.id(), operation);
         }
-        ops.into_values().collect()
+        deduped.reverse();
+        deduped
     }
 
     fn handle_conversation_event(
@@ -1397,12 +1682,35 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS worktree_group_overrides(
+                remote_connection_identity TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                custom_name TEXT,
+                collapsed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(remote_connection_identity, worktree_path)
+            ) STRICT;
+        ),
     ];
 }
 
 db::static_connection!(ThreadMetadataDb, []);
 
 impl ThreadMetadataDb {
+    fn path_to_db_string(path: PathBuf) -> String {
+        path.to_string_lossy().to_string()
+    }
+
+    fn remote_connection_identity_to_db_string(
+        identity: Option<&RemoteConnectionIdentity>,
+    ) -> anyhow::Result<String> {
+        identity
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize remote connection identity")
+            .map(|identity| identity.unwrap_or_default())
+    }
+
     #[allow(dead_code)]
     pub fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
         self.select::<ThreadId>(
@@ -1422,6 +1730,104 @@ impl ThreadMetadataDb {
     /// Only returns threads that have a `session_id`.
     pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
         self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
+    }
+
+    async fn load_worktree_overrides(&self) -> anyhow::Result<Vec<WorktreeOverrideRow>> {
+        self.write(move |conn| {
+            conn.select::<WorktreeOverrideRow>(
+                "SELECT remote_connection_identity, worktree_path, custom_name, collapsed \
+                 FROM worktree_group_overrides \
+                 ORDER BY remote_connection_identity, worktree_path",
+            )?()
+        })
+        .await
+    }
+
+    async fn upsert_worktree_override(
+        &self,
+        key: WorktreeGroupOverrideKey,
+        custom_name: Option<String>,
+        collapsed: bool,
+    ) -> anyhow::Result<()> {
+        let remote_connection_identity =
+            Self::remote_connection_identity_to_db_string(key.remote_connection_identity.as_ref())?;
+        let path = Self::path_to_db_string(key.path);
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "INSERT INTO worktree_group_overrides(remote_connection_identity, worktree_path, custom_name, collapsed) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(remote_connection_identity, worktree_path) DO UPDATE SET \
+                     custom_name = excluded.custom_name, \
+                     collapsed = excluded.collapsed",
+            )?;
+            let mut i = stmt.bind(&remote_connection_identity, 1)?;
+            i = stmt.bind(&path, i)?;
+            i = stmt.bind(&custom_name, i)?;
+            stmt.bind(&collapsed, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    async fn delete_worktree_override(&self, key: WorktreeGroupOverrideKey) -> anyhow::Result<()> {
+        let remote_connection_identity =
+            Self::remote_connection_identity_to_db_string(key.remote_connection_identity.as_ref())?;
+        let path = Self::path_to_db_string(key.path);
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "DELETE FROM worktree_group_overrides \
+                 WHERE remote_connection_identity = ? AND worktree_path = ?",
+            )?;
+            let next_index = stmt.bind(&remote_connection_identity, 1)?;
+            stmt.bind(&path, next_index)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    async fn delete_worktree_overrides_not_in(
+        &self,
+        remote_connection_identity: Option<RemoteConnectionIdentity>,
+        keep_paths: Vec<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let remote_connection_identity =
+            Self::remote_connection_identity_to_db_string(remote_connection_identity.as_ref())?;
+        let keep_paths = keep_paths
+            .into_iter()
+            .map(Self::path_to_db_string)
+            .collect::<Vec<_>>();
+
+        self.write(move |conn| {
+            if keep_paths.is_empty() {
+                let mut stmt = Statement::prepare(
+                    conn,
+                    "DELETE FROM worktree_group_overrides \
+                     WHERE remote_connection_identity = ?",
+                )?;
+                stmt.bind(&remote_connection_identity, 1)?;
+                return stmt.exec();
+            }
+
+            let placeholders = keep_paths
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DELETE FROM worktree_group_overrides \
+                 WHERE remote_connection_identity = ? \
+                 AND worktree_path NOT IN ({placeholders})"
+            );
+            let mut stmt = Statement::prepare(conn, sql)?;
+            let mut next_index = stmt.bind(&remote_connection_identity, 1)?;
+            for path in keep_paths {
+                next_index = stmt.bind(&path, next_index)?;
+            }
+            stmt.exec()
+        })
+        .await
     }
 
     /// Upsert metadata for a thread.
@@ -1753,6 +2159,36 @@ impl Column for ArchivedGitWorktree {
     }
 }
 
+impl Column for WorktreeOverrideRow {
+    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
+        let (remote_connection_identity, next): (String, i32) =
+            Column::column(statement, start_index)?;
+        let (path, next): (String, i32) = Column::column(statement, next)?;
+        let (custom_name, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (collapsed, next): (i64, i32) = Column::column(statement, next)?;
+        let remote_connection_identity = if remote_connection_identity.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str::<RemoteConnectionIdentity>(&remote_connection_identity)
+                    .context("deserialize worktree group override remote connection identity")?,
+            )
+        };
+
+        Ok((
+            WorktreeOverrideRow {
+                key: WorktreeGroupOverrideKey {
+                    remote_connection_identity,
+                    path: PathBuf::from(path),
+                },
+                custom_name,
+                collapsed: collapsed != 0,
+            },
+            next,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,6 +2373,148 @@ mod tests {
             assert_eq!(metadata.title_override.as_deref(), Some("User Title"));
             assert_eq!(metadata.display_title().as_ref(), "User Title");
         });
+    }
+
+    #[gpui::test]
+    async fn test_worktree_custom_name_clears_empty_default_override(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let path = PathBuf::from("/project-a");
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.set_worktree_custom_name(None, path.clone(), "  Project A  ".into(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store.worktree_custom_name(None, &path).as_deref(),
+                Some("Project A")
+            );
+            assert!(!store.is_worktree_collapsed(None, &path));
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.set_worktree_custom_name(None, path.clone(), "   ".into(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let rows = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(store.worktree_override(None, &path).is_none());
+            store.db.clone()
+        });
+        let rows = rows.load_worktree_overrides().await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_worktree_overrides_removes_unreferenced_paths(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let keep_path = PathBuf::from("/project-a");
+        let stale_path = PathBuf::from("/project-b");
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.set_worktree_custom_name(None, keep_path.clone(), "Project A".into(), cx);
+                store.set_worktree_collapsed(None, stale_path.clone(), true, cx);
+                store.set_worktree_custom_name(
+                    Some(&remote),
+                    stale_path.clone(),
+                    "Remote".into(),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let keep_paths = vec![keep_path.clone()];
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.cleanup_worktree_overrides_not_in(None, keep_paths, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let rows = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store.worktree_custom_name(None, &keep_path).as_deref(),
+                Some("Project A")
+            );
+            assert!(store.worktree_override(None, &stale_path).is_none());
+            assert_eq!(
+                store
+                    .worktree_custom_name(Some(&remote), &stale_path)
+                    .as_deref(),
+                Some("Remote")
+            );
+            store.db.clone()
+        });
+        let rows = rows.load_worktree_overrides().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.key.path == keep_path
+                && row.key.remote_connection_identity.is_none()
+                && row.custom_name.as_deref() == Some("Project A")
+                && !row.collapsed
+        }));
+        assert!(rows.iter().any(|row| {
+            row.key.path == stale_path
+                && row.key.remote_connection_identity.is_some()
+                && row.custom_name.as_deref() == Some("Remote")
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_worktree_overrides_are_scoped_by_remote_identity(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let path = PathBuf::from("/project");
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.set_worktree_custom_name(None, path.clone(), "Local".into(), cx);
+                store.set_worktree_custom_name(Some(&remote), path.clone(), "Remote".into(), cx);
+                store.set_worktree_collapsed(Some(&remote), path.clone(), true, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let rows = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store.worktree_custom_name(None, &path).as_deref(),
+                Some("Local")
+            );
+            assert!(!store.is_worktree_collapsed(None, &path));
+            assert_eq!(
+                store.worktree_custom_name(Some(&remote), &path).as_deref(),
+                Some("Remote")
+            );
+            assert!(store.is_worktree_collapsed(Some(&remote), &path));
+            store.db.clone()
+        });
+
+        let rows = rows.load_worktree_overrides().await.unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     #[gpui::test]
@@ -2842,6 +3420,38 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         assert!(deduped.contains(&DbOperation::Upsert(metadata1)));
         assert!(deduped.contains(&DbOperation::Upsert(metadata2)));
+    }
+
+    #[test]
+    fn test_dedup_db_operations_keeps_latest_worktree_override() {
+        let key = WorktreeGroupOverrideKey::new(PathBuf::from("/project"), None);
+        let old_override = WorktreeGroupOverride {
+            custom_name: Some("Old".into()),
+            collapsed: false,
+        };
+        let new_override = WorktreeGroupOverride {
+            custom_name: Some("New".into()),
+            collapsed: true,
+        };
+
+        let deduped = ThreadMetadataStore::dedup_db_operations(vec![
+            DbOperation::SetWorktreeOverride {
+                key: key.clone(),
+                override_: Some(old_override),
+            },
+            DbOperation::SetWorktreeOverride {
+                key: key.clone(),
+                override_: Some(new_override.clone()),
+            },
+        ]);
+
+        assert_eq!(
+            deduped,
+            vec![DbOperation::SetWorktreeOverride {
+                key,
+                override_: Some(new_override),
+            }]
+        );
     }
 
     #[gpui::test]

@@ -47,10 +47,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
-    AgentThreadStatus, CommonAnimationExt, ContextMenu, Divider, GradientFade, HighlightedLabel,
-    KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars, Tab,
-    ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar, prelude::*,
-    render_modifiers,
+    AgentThreadStatus, CommonAnimationExt, ContextMenu, Disclosure, Divider, GradientFade,
+    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
+    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
+    prelude::*, render_modifiers,
 };
 use util::ResultExt as _;
 use util::path_list::PathList;
@@ -81,6 +81,12 @@ gpui::actions!(
         NewThreadInGroup,
         /// Toggles between the thread list and the thread history.
         ToggleThreadHistory,
+        /// Begin editing the display name of the focused worktree group.
+        RenameWorktreeGroup,
+        /// Commit the in-flight worktree group rename.
+        ConfirmWorktreeGroupRename,
+        /// Cancel the in-flight worktree group rename.
+        CancelWorktreeGroupRename,
     ]
 );
 
@@ -273,6 +279,16 @@ enum ListEntry {
         is_active: bool,
         has_threads: bool,
     },
+    WorktreeHeader {
+        project_group_key: ProjectGroupKey,
+        worktree_path: PathBuf,
+        display_name: SharedString,
+        branch_name: Option<SharedString>,
+        git_status: WorktreeGitStatus,
+        has_custom_name: bool,
+        is_collapsed: bool,
+        thread_count: usize,
+    },
     Thread(ThreadEntry),
     Terminal(TerminalEntry),
 }
@@ -300,7 +316,7 @@ impl ActivatableEntry {
                 terminal_id: terminal.id,
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => None,
         }
     }
 
@@ -334,7 +350,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_)
+            | ListEntry::ProjectHeader { .. }
+            | ListEntry::WorktreeHeader { .. } => None,
         }
     }
 
@@ -351,6 +369,11 @@ impl ListEntry {
             ListEntry::Terminal(terminal) => vec![terminal.workspace.clone()],
             ListEntry::ProjectHeader { key, .. } => multi_workspace
                 .workspaces_for_project_group(key, cx)
+                .unwrap_or_default(),
+            ListEntry::WorktreeHeader {
+                project_group_key, ..
+            } => multi_workspace
+                .workspaces_for_project_group(project_group_key, cx)
                 .unwrap_or_default(),
         }
     }
@@ -407,6 +430,69 @@ fn root_repository_snapshots(
             .any(|p| p.as_path() == snapshot.work_directory_abs_path.as_ref());
         is_root.then_some(snapshot)
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorktreeGitStatus {
+    Clean,
+    UntrackedOnly,
+    Modified,
+    Conflicted,
+}
+
+impl WorktreeGitStatus {
+    fn chip_color(self, cx: &App) -> gpui::Hsla {
+        let colors = cx.theme().colors();
+        match self {
+            WorktreeGitStatus::Clean => colors.text_muted,
+            WorktreeGitStatus::UntrackedOnly => colors.editor_document_highlight_read_background,
+            WorktreeGitStatus::Modified => colors.version_control_modified,
+            WorktreeGitStatus::Conflicted => colors.version_control_conflict,
+        }
+    }
+}
+
+fn classify_worktree_git_status(
+    snapshot: &project::git_store::RepositorySnapshot,
+) -> WorktreeGitStatus {
+    if !snapshot.merge.merge_heads_by_conflicted_path.is_empty() {
+        return WorktreeGitStatus::Conflicted;
+    }
+
+    let mut has_untracked = false;
+    for entry in snapshot.status() {
+        match entry.status {
+            git::status::FileStatus::Untracked => has_untracked = true,
+            git::status::FileStatus::Ignored => {}
+            git::status::FileStatus::Unmerged(_) => return WorktreeGitStatus::Conflicted,
+            git::status::FileStatus::Tracked(_) => return WorktreeGitStatus::Modified,
+        }
+    }
+
+    if has_untracked {
+        WorktreeGitStatus::UntrackedOnly
+    } else {
+        WorktreeGitStatus::Clean
+    }
+}
+
+fn primary_worktree_path_for_thread(
+    thread_main_paths: &PathList,
+    group_paths: &PathList,
+) -> Option<PathBuf> {
+    for thread_path in thread_main_paths.ordered_paths() {
+        if group_paths
+            .paths()
+            .iter()
+            .any(|group_path| group_path.as_path() == thread_path.as_path())
+        {
+            return Some(thread_path.to_path_buf());
+        }
+    }
+    group_paths
+        .ordered_paths()
+        .next()
+        .map(|path| path.to_path_buf())
 }
 
 fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
@@ -572,6 +658,13 @@ fn connect_remote(
 /// change via `update_entries` → `rebuild_contents`. Avoid adding
 /// incremental or inter-event coordination state — if something can
 /// be computed from the current world state, compute it in the rebuild.
+struct WorktreeRenameEditor {
+    project_group_key: ProjectGroupKey,
+    worktree_path: PathBuf,
+    editor: Entity<Editor>,
+    _subscription: gpui::Subscription,
+}
+
 pub struct Sidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
     width: Pixels,
@@ -600,6 +693,9 @@ pub struct Sidebar {
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
+    worktree_rename_editor: Option<WorktreeRenameEditor>,
+    worktree_header_menu_handles:
+        HashMap<(ProjectGroupKey, PathBuf), PopoverMenuHandle<ContextMenu>>,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     /// For the thread import banners, if there is just one we show "Import
@@ -697,6 +793,8 @@ impl Sidebar {
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             project_header_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
+            worktree_rename_editor: None,
+            worktree_header_menu_handles: HashMap::new(),
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             import_banners_use_verbose_labels: None,
@@ -1171,16 +1269,20 @@ impl Sidebar {
             all_paths.into_iter().zip(path_details).collect();
 
         let mut branch_by_path: HashMap<PathBuf, SharedString> = HashMap::new();
+        let mut git_status_by_path: HashMap<PathBuf, WorktreeGitStatus> = HashMap::new();
         for ws in &workspaces {
             let project = ws.read(cx).project().read(cx);
             for repo in project.repositories(cx).values() {
                 let snapshot = repo.read(cx).snapshot();
+                let status = classify_worktree_git_status(&snapshot);
+                let main_path = snapshot.work_directory_abs_path.to_path_buf();
                 if let Some(branch) = &snapshot.branch {
                     branch_by_path.insert(
-                        snapshot.work_directory_abs_path.to_path_buf(),
+                        main_path.clone(),
                         SharedString::from(Arc::<str>::from(branch.name())),
                     );
                 }
+                git_status_by_path.insert(main_path, status);
                 for linked_wt in snapshot.linked_worktrees() {
                     if let Some(branch) = linked_wt.branch_name() {
                         branch_by_path.insert(
@@ -1188,6 +1290,7 @@ impl Sidebar {
                             SharedString::from(Arc::<str>::from(branch)),
                         );
                     }
+                    git_status_by_path.insert(linked_wt.path.clone(), status);
                 }
             }
         }
@@ -1570,13 +1673,86 @@ impl Sidebar {
                     continue;
                 }
 
-                Self::push_entries_by_display_time(
-                    &mut entries,
-                    terminals,
-                    threads,
-                    &mut current_session_ids,
-                    &mut current_thread_ids,
-                );
+                for terminal in terminals {
+                    entries.push(ListEntry::Terminal(terminal));
+                }
+
+                let group_paths = group_key.path_list();
+                let mut threads_by_worktree: HashMap<PathBuf, Vec<ThreadEntry>> = HashMap::new();
+                for thread in threads {
+                    if let Some(primary_path) = primary_worktree_path_for_thread(
+                        thread.metadata.main_worktree_paths(),
+                        group_paths,
+                    ) {
+                        threads_by_worktree
+                            .entry(primary_path)
+                            .or_default()
+                            .push(thread);
+                    }
+                }
+
+                let store = ThreadMetadataStore::global(cx).read(cx);
+                for worktree_path in group_paths.ordered_paths() {
+                    let worktree_path = worktree_path.to_path_buf();
+                    let bucket = threads_by_worktree
+                        .remove(&worktree_path)
+                        .unwrap_or_default();
+                    let thread_count = bucket.len();
+
+                    let override_entry = store
+                        .worktree_override(group_host.as_ref(), &worktree_path)
+                        .cloned();
+                    let custom_name = override_entry
+                        .as_ref()
+                        .and_then(|override_entry| override_entry.custom_name.clone());
+                    let is_worktree_collapsed = override_entry
+                        .as_ref()
+                        .is_some_and(|override_entry| override_entry.collapsed);
+
+                    let derived_name = worktree_path
+                        .file_name()
+                        .map(|name| SharedString::from(name.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| {
+                            SharedString::from(worktree_path.to_string_lossy().to_string())
+                        });
+                    let display_name = custom_name.clone().unwrap_or(derived_name);
+                    let branch_name = branch_by_path.get(&worktree_path).cloned();
+                    let git_status = git_status_by_path
+                        .get(&worktree_path)
+                        .copied()
+                        .unwrap_or(WorktreeGitStatus::Clean);
+
+                    entries.push(ListEntry::WorktreeHeader {
+                        project_group_key: group_key.clone(),
+                        worktree_path,
+                        display_name,
+                        branch_name,
+                        git_status,
+                        has_custom_name: custom_name.is_some(),
+                        is_collapsed: is_worktree_collapsed,
+                        thread_count,
+                    });
+
+                    if is_worktree_collapsed {
+                        continue;
+                    }
+
+                    Self::push_entries_by_display_time(
+                        &mut entries,
+                        Vec::new(),
+                        bucket,
+                        &mut current_session_ids,
+                        &mut current_thread_ids,
+                    );
+                }
+
+                if !threads_by_worktree.is_empty() {
+                    log::warn!(
+                        "agents sidebar: {} threads in group {:?} did not match any worktree path",
+                        threads_by_worktree.values().map(Vec::len).sum::<usize>(),
+                        group_key
+                    );
+                }
             }
         }
 
@@ -1678,7 +1854,7 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(entry) = self.contents.entries.get(ix) else {
+        let Some(entry) = self.contents.entries.get(ix).cloned() else {
             return div().into_any_element();
         };
         let is_focused = self.focus_handle.is_focused(window);
@@ -1686,14 +1862,14 @@ impl Sidebar {
         let is_selected = is_focused && self.selection == Some(ix);
 
         let is_group_header_after_first =
-            ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
+            ix > 0 && matches!(&entry, ListEntry::ProjectHeader { .. });
 
         let is_active = self
             .active_entry
             .as_ref()
-            .is_some_and(|active| active.matches_entry(entry));
+            .is_some_and(|active| active.matches_entry(&entry));
 
-        let rendered = match entry {
+        let rendered = match &entry {
             ListEntry::ProjectHeader {
                 key,
                 label,
@@ -1730,6 +1906,29 @@ impl Sidebar {
                     cx,
                 )
             }
+            ListEntry::WorktreeHeader {
+                project_group_key,
+                worktree_path,
+                display_name,
+                branch_name,
+                git_status,
+                has_custom_name,
+                is_collapsed,
+                thread_count,
+            } => self.render_worktree_header(
+                ix,
+                project_group_key,
+                worktree_path,
+                display_name,
+                branch_name.as_ref(),
+                *git_status,
+                *has_custom_name,
+                *is_collapsed,
+                *thread_count,
+                is_selected,
+                window,
+                cx,
+            ),
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
@@ -1770,6 +1969,170 @@ impl Sidebar {
                 .tooltip(Tooltip::text("Remote Project"))
                 .into_any_element(),
         )
+    }
+
+    fn render_worktree_branch_chip(
+        branch_name: Option<&SharedString>,
+        git_status: WorktreeGitStatus,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let branch_name = branch_name?.clone();
+        Some(
+            h_flex()
+                .px_1p5()
+                .py_0p5()
+                .max_w_24()
+                .rounded_sm()
+                .bg(git_status.chip_color(cx))
+                .child(
+                    Label::new(branch_name)
+                        .size(LabelSize::XSmall)
+                        .truncate()
+                        .color(Color::Default),
+                )
+                .into_any_element(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_worktree_header(
+        &mut self,
+        ix: usize,
+        project_group_key: &ProjectGroupKey,
+        worktree_path: &Path,
+        display_name: &SharedString,
+        branch_name: Option<&SharedString>,
+        git_status: WorktreeGitStatus,
+        has_custom_name: bool,
+        is_collapsed: bool,
+        thread_count: usize,
+        is_selected: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let worktree_path = worktree_path.to_path_buf();
+        let id = SharedString::from(format!("worktree-header-{ix}"));
+        let group_name = SharedString::from(format!("worktree-header-group-{ix}"));
+        let is_editing = self.worktree_rename_editor.as_ref().is_some_and(|state| {
+            state.project_group_key == *project_group_key && state.worktree_path == worktree_path
+        });
+
+        let project_group_key = project_group_key.clone();
+        let disclosure = Disclosure::new(format!("worktree-header-{ix}-disclosure"), !is_collapsed)
+            .on_click({
+                let worktree_path = worktree_path.clone();
+                let project_group_key = project_group_key.clone();
+                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_worktree_collapsed(&project_group_key, worktree_path.clone(), cx);
+                })
+            });
+
+        let label_or_editor: AnyElement = if is_editing {
+            self.worktree_rename_editor
+                .as_ref()
+                .map(|state| {
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(state.editor.clone())
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| {
+                    Label::new(display_name.clone())
+                        .truncate()
+                        .into_any_element()
+                })
+        } else {
+            Label::new(display_name.clone())
+                .size(LabelSize::Small)
+                .truncate()
+                .when(has_custom_name, |label| label.color(Color::Accent))
+                .into_any_element()
+        };
+
+        let menu_handle = self
+            .worktree_header_menu_handles
+            .entry((project_group_key.clone(), worktree_path.clone()))
+            .or_default()
+            .clone();
+        let this = cx.weak_entity();
+        let branch_chip = Self::render_worktree_branch_chip(branch_name, git_status, cx);
+
+        let menu = PopoverMenu::new(format!("worktree-header-{ix}-menu"))
+            .with_handle(menu_handle.clone())
+            .trigger(
+                IconButton::new(
+                    format!("worktree-header-{ix}-menu-button"),
+                    IconName::Ellipsis,
+                )
+                .icon_size(IconSize::Small)
+                .style(ButtonStyle::Transparent)
+                .visible_on_hover(&group_name),
+            )
+            .menu({
+                let project_group_key = project_group_key.clone();
+                let worktree_path = worktree_path.clone();
+                move |window, cx| {
+                    let this = this.upgrade()?;
+                    Some(this.update(cx, |sidebar, cx| {
+                        sidebar.build_worktree_header_menu(
+                            worktree_path.clone(),
+                            project_group_key.clone(),
+                            has_custom_name,
+                            window,
+                            cx,
+                        )
+                    }))
+                }
+            })
+            .anchor(gpui::Anchor::TopRight)
+            .offset(gpui::Point {
+                x: px(0.),
+                y: px(1.),
+            });
+
+        let colors = cx.theme().colors();
+        let row = h_flex()
+            .id(id)
+            .group(&group_name)
+            .w_full()
+            .h(Tab::content_height(cx))
+            .pl_4()
+            .pr_1p5()
+            .gap_1()
+            .border_1()
+            .border_color(if is_selected {
+                colors.border_focused
+            } else {
+                gpui::transparent_black()
+            })
+            .hover(|style| style.bg(colors.element_hover))
+            .child(disclosure)
+            .child(label_or_editor)
+            .child(div().flex_1())
+            .when_some(branch_chip, |this, chip| this.child(chip))
+            .when(is_collapsed && thread_count > 0, |this| {
+                this.child(
+                    Label::new(SharedString::from(thread_count.to_string()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+            .child(menu)
+            .on_mouse_down(gpui::MouseButton::Right, {
+                move |_, window, cx| {
+                    cx.stop_propagation();
+                    menu_handle.show(window, cx);
+                }
+            })
+            .on_click({
+                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_worktree_collapsed(&project_group_key, worktree_path.clone(), cx);
+                })
+            });
+
+        let _ = window;
+        row.into_any_element()
     }
 
     fn render_project_header(
@@ -2423,6 +2786,175 @@ impl Sidebar {
         self.update_entries(cx);
     }
 
+    fn toggle_worktree_collapsed(
+        &mut self,
+        project_group_key: &ProjectGroupKey,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let remote_connection = project_group_key.host();
+        let store = ThreadMetadataStore::global(cx);
+        let currently_collapsed = store
+            .read(cx)
+            .is_worktree_collapsed(remote_connection.as_ref(), &worktree_path);
+        store.update(cx, |store, cx| {
+            store.set_worktree_collapsed(
+                remote_connection.as_ref(),
+                worktree_path,
+                !currently_collapsed,
+                cx,
+            );
+        });
+        self.update_entries(cx);
+    }
+
+    fn build_worktree_header_menu(
+        &mut self,
+        worktree_path: PathBuf,
+        project_group_key: ProjectGroupKey,
+        has_custom_name: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let this = cx.weak_entity();
+        ContextMenu::build(window, cx, move |menu, _window, _cx| {
+            let menu = menu.entry("Rename Group", None, {
+                let this = this.clone();
+                let worktree_path = worktree_path.clone();
+                let project_group_key = project_group_key.clone();
+                move |window, cx| {
+                    this.update(cx, |sidebar, cx| {
+                        sidebar.begin_rename_worktree_group(
+                            project_group_key.clone(),
+                            worktree_path.clone(),
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+                }
+            });
+
+            if has_custom_name {
+                menu.entry("Reset Group Name", None, {
+                    let this = this.clone();
+                    let remote_connection = project_group_key.host();
+                    move |_window, cx| {
+                        this.update(cx, |sidebar, cx| {
+                            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                                store.clear_worktree_custom_name(
+                                    remote_connection.as_ref(),
+                                    &worktree_path,
+                                    cx,
+                                );
+                            });
+                            sidebar.update_entries(cx);
+                        })
+                        .ok();
+                    }
+                })
+            } else {
+                menu
+            }
+        })
+    }
+
+    fn begin_rename_worktree_group(
+        &mut self,
+        project_group_key: ProjectGroupKey,
+        worktree_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let remote_connection = project_group_key.host();
+        let initial_name = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .worktree_custom_name(remote_connection.as_ref(), &worktree_path)
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| {
+                worktree_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
+
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(initial_name, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor
+        });
+
+        let subscription = cx.subscribe_in(&editor, window, {
+            let editor = editor.clone();
+            let project_group_key = project_group_key.clone();
+            let worktree_path = worktree_path.clone();
+            move |_this, _, event: &editor::EditorEvent, window, cx| {
+                if let editor::EditorEvent::Blurred = event {
+                    let editor = editor.clone();
+                    let project_group_key = project_group_key.clone();
+                    let worktree_path = worktree_path.clone();
+                    cx.defer_in(window, move |this, _window, cx| {
+                        let editor_id = editor.entity_id();
+                        let still_current = this
+                            .worktree_rename_editor
+                            .as_ref()
+                            .is_some_and(|state| state.editor.entity_id() == editor_id);
+                        if still_current {
+                            this.commit_worktree_rename(
+                                project_group_key.clone(),
+                                worktree_path.clone(),
+                                &editor,
+                                cx,
+                            );
+                        }
+                    });
+                }
+            }
+        });
+
+        let focus_handle = editor.focus_handle(cx);
+        self.worktree_rename_editor = Some(WorktreeRenameEditor {
+            project_group_key,
+            worktree_path,
+            editor,
+            _subscription: subscription,
+        });
+        focus_handle.focus(window, cx);
+        self.update_entries(cx);
+    }
+
+    fn commit_worktree_rename(
+        &mut self,
+        project_group_key: ProjectGroupKey,
+        worktree_path: PathBuf,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = editor.read(cx).text(cx);
+        let remote_connection = project_group_key.host();
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                store.clear_worktree_custom_name(remote_connection.as_ref(), &worktree_path, cx);
+            } else {
+                store.set_worktree_custom_name(
+                    remote_connection.as_ref(),
+                    worktree_path.clone(),
+                    SharedString::from(trimmed.to_string()),
+                    cx,
+                );
+            }
+        });
+        self.worktree_rename_editor = None;
+        self.update_entries(cx);
+    }
+
+    fn cancel_worktree_rename(&mut self, cx: &mut Context<Self>) {
+        self.worktree_rename_editor = None;
+        self.update_entries(cx);
+    }
+
     fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("ThreadsSidebar");
@@ -2439,6 +2971,13 @@ impl Sidebar {
         };
 
         dispatch_context.add(identifier);
+        if self
+            .worktree_rename_editor
+            .as_ref()
+            .is_some_and(|state| state.editor.focus_handle(cx).is_focused(window))
+        {
+            dispatch_context.add("renaming_worktree");
+        }
         dispatch_context
     }
 
@@ -2593,14 +3132,20 @@ impl Sidebar {
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.selection else { return };
-        let Some(entry) = self.contents.entries.get(ix) else {
+        let Some(entry) = self.contents.entries.get(ix).cloned() else {
             return;
         };
 
         match entry {
             ListEntry::ProjectHeader { key, .. } => {
-                let key = key.clone();
                 self.toggle_collapse(&key, window, cx);
+            }
+            ListEntry::WorktreeHeader {
+                project_group_key,
+                worktree_path,
+                ..
+            } => {
+                self.toggle_worktree_collapsed(&project_group_key, worktree_path, cx);
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
@@ -3142,12 +3687,25 @@ impl Sidebar {
     ) {
         let Some(ix) = self.selection else { return };
 
-        match self.contents.entries.get(ix) {
+        match self.contents.entries.get(ix).cloned() {
             Some(ListEntry::ProjectHeader { key, .. }) => {
-                let key = key.clone();
                 if self.is_group_collapsed(&key, cx) {
                     self.set_group_expanded(&key, true, cx);
                     self.update_entries(cx);
+                } else if ix + 1 < self.contents.entries.len() {
+                    self.selection = Some(ix + 1);
+                    self.list_state.scroll_to_reveal_item(ix + 1);
+                    cx.notify();
+                }
+            }
+            Some(ListEntry::WorktreeHeader {
+                project_group_key,
+                worktree_path,
+                is_collapsed,
+                ..
+            }) => {
+                if is_collapsed {
+                    self.toggle_worktree_collapsed(&project_group_key, worktree_path, cx);
                 } else if ix + 1 < self.contents.entries.len() {
                     self.selection = Some(ix + 1);
                     self.list_state.scroll_to_reveal_item(ix + 1);
@@ -3166,24 +3724,50 @@ impl Sidebar {
     ) {
         let Some(ix) = self.selection else { return };
 
-        match self.contents.entries.get(ix) {
+        match self.contents.entries.get(ix).cloned() {
             Some(ListEntry::ProjectHeader { key, .. }) => {
-                let key = key.clone();
                 if !self.is_group_collapsed(&key, cx) {
                     self.set_group_expanded(&key, false, cx);
                     self.update_entries(cx);
                 }
             }
+            Some(ListEntry::WorktreeHeader {
+                project_group_key,
+                worktree_path,
+                is_collapsed,
+                ..
+            }) => {
+                if !is_collapsed {
+                    self.toggle_worktree_collapsed(&project_group_key, worktree_path, cx);
+                }
+            }
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
-                for i in (0..ix).rev() {
-                    if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
-                    {
-                        let key = key.clone();
-                        self.selection = Some(i);
+                let Some(parent_ix) = (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. })
+                    )
+                }) else {
+                    return;
+                };
+                match self.contents.entries.get(parent_ix).cloned() {
+                    Some(ListEntry::ProjectHeader { key, .. }) => {
+                        self.selection = Some(parent_ix);
                         self.set_group_expanded(&key, false, cx);
                         self.update_entries(cx);
-                        break;
                     }
+                    Some(ListEntry::WorktreeHeader {
+                        project_group_key,
+                        worktree_path,
+                        is_collapsed,
+                        ..
+                    }) => {
+                        self.selection = Some(parent_ix);
+                        if !is_collapsed {
+                            self.toggle_worktree_collapsed(&project_group_key, worktree_path, cx);
+                        }
+                    }
+                    _ => {}
                 }
             }
             None => {}
@@ -3198,29 +3782,39 @@ impl Sidebar {
     ) {
         let Some(ix) = self.selection else { return };
 
-        // Find the group header for the current selection.
-        let header_ix = match self.contents.entries.get(ix) {
+        // Find the nearest foldable header for the current selection.
+        let header_ix = match self.contents.entries.get(ix).cloned() {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
+            Some(ListEntry::WorktreeHeader { .. }) => Some(ix),
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
                 matches!(
                     self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
+                    Some(ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. })
                 )
             }),
             None => None,
         };
 
         if let Some(header_ix) = header_ix {
-            if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(header_ix)
-            {
-                let key = key.clone();
-                if self.is_group_collapsed(&key, cx) {
-                    self.set_group_expanded(&key, true, cx);
-                } else {
-                    self.selection = Some(header_ix);
-                    self.set_group_expanded(&key, false, cx);
+            match self.contents.entries.get(header_ix).cloned() {
+                Some(ListEntry::ProjectHeader { key, .. }) => {
+                    if self.is_group_collapsed(&key, cx) {
+                        self.set_group_expanded(&key, true, cx);
+                    } else {
+                        self.selection = Some(header_ix);
+                        self.set_group_expanded(&key, false, cx);
+                    }
+                    self.update_entries(cx);
                 }
-                self.update_entries(cx);
+                Some(ListEntry::WorktreeHeader {
+                    project_group_key,
+                    worktree_path,
+                    ..
+                }) => {
+                    self.selection = Some(header_ix);
+                    self.toggle_worktree_collapsed(&project_group_key, worktree_path, cx);
+                }
+                _ => {}
             }
         }
     }
@@ -3983,7 +4577,9 @@ impl Sidebar {
             match entry {
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => {
+                    unreachable!()
+                }
             }
         }
 
@@ -4041,6 +4637,7 @@ impl Sidebar {
                     current_header_key = Some(key.clone());
                     None
                 }
+                ListEntry::WorktreeHeader { .. } => None,
                 ListEntry::Thread(thread) => {
                     let workspace = match &thread.workspace {
                         ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
@@ -4811,6 +5408,9 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+            Some(ListEntry::WorktreeHeader {
+                project_group_key, ..
+            }) => Some(project_group_key.clone()),
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
                 (0..ix)
                     .rev()
@@ -4999,7 +5599,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal(&workspace, terminal.id, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => {}
         }
     }
 
@@ -5629,6 +6229,40 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::on_previous_project))
             .on_action(cx.listener(Self::on_next_thread))
             .on_action(cx.listener(Self::on_previous_thread))
+            .on_action(cx.listener(|this, _: &RenameWorktreeGroup, window, cx| {
+                let Some(ix) = this.selection else {
+                    return;
+                };
+                let Some(ListEntry::WorktreeHeader {
+                    project_group_key,
+                    worktree_path,
+                    ..
+                }) = this.contents.entries.get(ix)
+                else {
+                    return;
+                };
+                this.begin_rename_worktree_group(
+                    project_group_key.clone(),
+                    worktree_path.clone(),
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(
+                cx.listener(|this, _: &ConfirmWorktreeGroupRename, _window, cx| {
+                    if let Some(state) = this.worktree_rename_editor.take() {
+                        let editor = state.editor;
+                        let project_group_key = state.project_group_key;
+                        let worktree_path = state.worktree_path;
+                        this.commit_worktree_rename(project_group_key, worktree_path, &editor, cx);
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &CancelWorktreeGroupRename, _window, cx| {
+                    this.cancel_worktree_rename(cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &OpenRecent, window, cx| {
                 this.recent_projects_popover_handle.toggle(window, cx);
             }))

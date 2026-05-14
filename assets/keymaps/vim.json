@@ -1196,6 +1196,13 @@
     },
   },
   {
+    "context": "ThreadsSidebar > Editor && renaming_worktree",
+    "bindings": {
+      "enter": "agents_sidebar::ConfirmWorktreeGroupRename",
+      "escape": "agents_sidebar::CancelWorktreeGroupRename",
+    },
+  },
+  {
     "context": "ThreadsSidebar > Editor && VimControl && vim_mode == normal",
     "bindings": {
       "j": "editor::MoveDown",
@@ -1203,6 +1210,13 @@
       "/": "vim::SwitchToInsertMode",
       "escape": "menu::Cancel",
       "enter": "editor::Newline",
+    },
+  },
+  {
+    "context": "ThreadsSidebar > Editor && VimControl && vim_mode == normal && renaming_worktree",
+    "bindings": {
+      "enter": "agents_sidebar::ConfirmWorktreeGroupRename",
+      "escape": "agents_sidebar::CancelWorktreeGroupRename",
     },
   },
 ]

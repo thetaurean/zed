@@ -732,6 +732,13 @@
     },
   },
   {
+    "context": "ThreadsSidebar > Editor && renaming_worktree",
+    "bindings": {
+      "enter": "agents_sidebar::ConfirmWorktreeGroupRename",
+      "escape": "agents_sidebar::CancelWorktreeGroupRename",
+    },
+  },
+  {
     "context": "ThreadSwitcher",
     "bindings": {
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
