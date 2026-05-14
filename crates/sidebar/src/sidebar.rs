@@ -2342,6 +2342,8 @@ impl Sidebar {
 
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
+        let key_for_drag = key.clone();
+        let drag_label = label.clone();
 
         let label = if highlight_positions.is_empty() {
             Label::new(label.clone())
@@ -2512,7 +2514,19 @@ impl Sidebar {
                         this.toggle_collapse(&key_for_toggle, window, cx);
                     }
                 }),
-            );
+            )
+            .when(!is_sticky, |this| {
+                this.on_drag(DraggedSidebarHeader::Project(key_for_drag), {
+                    let label = drag_label.clone();
+                    let width = self.width;
+                    move |_dragged, _click_offset, _window, cx| {
+                        cx.new(|_| DraggedHeaderView {
+                            label: label.clone(),
+                            width,
+                        })
+                    }
+                })
+            });
 
         if !is_collapsed && !has_threads {
             v_flex()
