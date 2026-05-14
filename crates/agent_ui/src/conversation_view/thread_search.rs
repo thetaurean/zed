@@ -1,16 +1,47 @@
 use std::ops::Range;
 
 use editor::Editor;
-use gpui::{Entity, Subscription};
+use gpui::{Entity, Subscription, Window};
 use markdown::Markdown;
+
+#[derive(Default, Clone, Copy)]
+pub struct SearchOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+}
 
 pub struct ThreadSearch {
     pub query_editor: Entity<Editor>,
     pub dismissed: bool,
     pub include_tool_calls: bool,
+    pub options: SearchOptions,
     pub matches: Vec<SearchMatch>,
     pub active_match_index: Option<usize>,
     pub _subscriptions: Vec<Subscription>,
+}
+
+impl ThreadSearch {
+    pub fn new(window: &mut Window, cx: &mut gpui::App) -> Self {
+        let query_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search messages…", window, cx);
+            editor
+        });
+        Self {
+            query_editor,
+            dismissed: true,
+            include_tool_calls: false,
+            options: SearchOptions::default(),
+            matches: Vec::new(),
+            active_match_index: None,
+            _subscriptions: Vec::new(),
+        }
+    }
+
+    pub fn query(&self, cx: &gpui::App) -> String {
+        self.query_editor.read(cx).text(cx)
+    }
 }
 
 #[derive(Clone)]
