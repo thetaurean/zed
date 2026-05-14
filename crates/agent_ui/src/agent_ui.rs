@@ -218,6 +218,8 @@ actions!(
         ScrollOutputToNextMessage,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
+        /// Toggles the in-panel search bar for the active thread.
+        ToggleSearch,
     ]
 );
 
