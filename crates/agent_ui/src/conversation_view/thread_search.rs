@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use acp_thread::{AgentThreadEntry, AssistantMessageChunk, ContentBlock, ToolCallContent};
 use editor::Editor;
 use gpui::{
     Action, AnyElement, AppContext, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
@@ -48,6 +49,33 @@ impl ThreadSearch {
 
     pub fn query(&self, cx: &gpui::App) -> String {
         self.query_editor.read(cx).text(cx)
+    }
+
+    pub fn update_matches(&mut self, sources: &[(usize, Entity<Markdown>)], cx: &gpui::App) {
+        let query = self.query(cx);
+        self.matches.clear();
+
+        if query.is_empty() {
+            self.active_match_index = None;
+            return;
+        }
+
+        for (entry_index, markdown) in sources {
+            let ranges = {
+                let markdown = markdown.read(cx);
+                find_matches_in_text(&query, markdown.source())
+            };
+
+            for range in ranges {
+                self.matches.push(SearchMatch {
+                    entry_index: *entry_index,
+                    markdown: markdown.clone(),
+                    range,
+                });
+            }
+        }
+
+        self.active_match_index = (!self.matches.is_empty()).then_some(0);
     }
 
     pub fn deploy(&mut self, window: &mut Window, cx: &mut gpui::App) {
@@ -121,6 +149,56 @@ impl ThreadSearch {
                 .into_any_element(),
         )
     }
+}
+
+pub fn collect_searchable_markdowns(
+    entries: &[AgentThreadEntry],
+    include_tool_calls: bool,
+) -> Vec<(usize, Entity<Markdown>)> {
+    entries
+        .iter()
+        .enumerate()
+        .flat_map(|(entry_index, entry)| {
+            let mut markdowns = Vec::new();
+
+            match entry {
+                AgentThreadEntry::UserMessage(message) => {
+                    if let ContentBlock::Markdown { markdown } = &message.content {
+                        markdowns.push((entry_index, markdown.clone()));
+                    }
+                }
+                AgentThreadEntry::AssistantMessage(message) => {
+                    for chunk in &message.chunks {
+                        let block = match chunk {
+                            AssistantMessageChunk::Message { block }
+                            | AssistantMessageChunk::Thought { block } => block,
+                        };
+
+                        if let ContentBlock::Markdown { markdown } = block {
+                            markdowns.push((entry_index, markdown.clone()));
+                        }
+                    }
+                }
+                AgentThreadEntry::ToolCall(tool_call) => {
+                    if include_tool_calls {
+                        markdowns.push((entry_index, tool_call.label.clone()));
+
+                        for content in &tool_call.content {
+                            if let ToolCallContent::ContentBlock(ContentBlock::Markdown {
+                                markdown,
+                            }) = content
+                            {
+                                markdowns.push((entry_index, markdown.clone()));
+                            }
+                        }
+                    }
+                }
+                AgentThreadEntry::CompletedPlan(_) => {}
+            }
+
+            markdowns
+        })
+        .collect()
 }
 
 fn format_match_counter(active_match_index: Option<usize>, match_count: usize) -> String {

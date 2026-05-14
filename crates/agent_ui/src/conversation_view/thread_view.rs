@@ -542,6 +542,18 @@ impl ThreadView {
             }));
         }));
 
+        let mut thread_search = ThreadSearch::new(window, cx);
+        let query_editor = thread_search.query_editor.clone();
+        thread_search._subscriptions.push(cx.subscribe_in(
+            &query_editor,
+            window,
+            |this, _, event, _window, cx| {
+                if let editor::EditorEvent::BufferEdited = event {
+                    this.refresh_thread_search(cx);
+                }
+            },
+        ));
+
         let mut this = Self {
             root_thread_id,
             session_id,
@@ -601,7 +613,7 @@ impl ThreadView {
             hovered_edited_file_buttons: None,
             in_flight_prompt: None,
             message_editor,
-            thread_search: ThreadSearch::new(window, cx),
+            thread_search,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
             project,
@@ -1622,6 +1634,16 @@ impl ThreadView {
             self.thread_search.dismiss(window, cx);
             self.message_editor.focus_handle(cx).focus(window, cx);
         }
+        cx.notify();
+    }
+
+    fn refresh_thread_search(&mut self, cx: &mut Context<Self>) {
+        let entries = self.thread.read(cx).entries();
+        let sources = super::thread_search::collect_searchable_markdowns(
+            entries,
+            self.thread_search.include_tool_calls,
+        );
+        self.thread_search.update_matches(&sources, cx);
         cx.notify();
     }
 
