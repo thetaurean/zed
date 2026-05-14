@@ -1976,6 +1976,42 @@ impl Sidebar {
         }
     }
 
+    fn compute_drop_edge<T: 'static>(event: &gpui::DragMoveEvent<T>) -> DropEdge {
+        let local_y = event.event.position.y - event.bounds.origin.y;
+        if local_y < event.bounds.size.height / 2.0 {
+            DropEdge::Above
+        } else {
+            DropEdge::Below
+        }
+    }
+
+    fn on_project_drop(
+        &mut self,
+        dragged: &DraggedSidebarHeader,
+        target_key: &ProjectGroupKey,
+        edge: DropEdge,
+        cx: &mut Context<Self>,
+    ) {
+        let DraggedSidebarHeader::Project(from_key) = dragged else {
+            self.clear_drop_target(cx);
+            return;
+        };
+
+        if from_key == target_key {
+            self.clear_drop_target(cx);
+            return;
+        }
+
+        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.reorder_project_groups(from_key, target_key, edge);
+                multi_workspace.serialize(cx);
+            });
+        }
+        self.drop_target = None;
+        self.update_entries(cx);
+    }
+
     /// Re-establishes subscriptions to each visible draft's message editor
     /// so we rebuild entries (and their displayed titles) as the user types.
     fn refresh_draft_editor_observations(&mut self, cx: &mut Context<Self>) {
@@ -2515,6 +2551,60 @@ impl Sidebar {
                     }
                 }),
             )
+            .on_drag_move::<DraggedSidebarHeader>({
+                let target_key = key.clone();
+                cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<DraggedSidebarHeader>, _window, cx| {
+                        let is_current_project_target = matches!(
+                            this.drop_target.as_ref(),
+                            Some(DropTargetIndicator::Project {
+                                target_key: current_target_key,
+                                ..
+                            }) if current_target_key == &target_key
+                        );
+
+                        if !event.bounds.contains(&event.event.position) {
+                            if is_current_project_target {
+                                this.drop_target = None;
+                                cx.notify();
+                            }
+                            return;
+                        }
+
+                        let dragged = event.drag(cx);
+                        if !matches!(dragged, DraggedSidebarHeader::Project(_)) {
+                            if this.drop_target.is_some() {
+                                this.drop_target = None;
+                                cx.notify();
+                            }
+                            return;
+                        }
+
+                        let edge = Self::compute_drop_edge(event);
+                        let new_target = DropTargetIndicator::Project {
+                            target_key: target_key.clone(),
+                            edge,
+                        };
+                        if this.drop_target.as_ref() != Some(&new_target) {
+                            this.drop_target = Some(new_target);
+                            cx.notify();
+                        }
+                    },
+                )
+            })
+            .on_drop({
+                let target_key = key.clone();
+                cx.listener(move |this, dragged: &DraggedSidebarHeader, _window, cx| {
+                    let edge = match &this.drop_target {
+                        Some(DropTargetIndicator::Project {
+                            target_key: t,
+                            edge,
+                        }) if t == &target_key => *edge,
+                        _ => DropEdge::Below,
+                    };
+                    this.on_project_drop(dragged, &target_key, edge, cx);
+                })
+            })
             .when(!is_sticky, |this| {
                 this.on_drag(DraggedSidebarHeader::Project(key_for_drag), {
                     let label = drag_label.clone();
