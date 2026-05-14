@@ -114,6 +114,13 @@ pub enum SidebarEvent {
     SerializeNeeded,
 }
 
+/// Where a drop falls relative to the hovered header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropEdge {
+    Above,
+    Below,
+}
+
 pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     fn width(&self, cx: &App) -> Pixels;
     fn set_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>);
@@ -844,6 +851,41 @@ impl MultiWorkspace {
         self.project_groups
             .iter_mut()
             .find(|group| group.key == *key)
+    }
+
+    pub(crate) fn reorder_project_groups_in_vec(
+        groups: &mut Vec<ProjectGroupState>,
+        from: &ProjectGroupKey,
+        to: &ProjectGroupKey,
+        edge: DropEdge,
+    ) {
+        if from == to {
+            return;
+        }
+        let Some(from_ix) = groups.iter().position(|group| group.key == *from) else {
+            return;
+        };
+        let Some(to_ix) = groups.iter().position(|group| group.key == *to) else {
+            return;
+        };
+
+        let moved = groups.remove(from_ix);
+        let adjusted_to_ix = if from_ix < to_ix { to_ix - 1 } else { to_ix };
+        let insert_at = match edge {
+            DropEdge::Above => adjusted_to_ix,
+            DropEdge::Below => adjusted_to_ix + 1,
+        };
+        let insert_at = insert_at.min(groups.len());
+        groups.insert(insert_at, moved);
+    }
+
+    pub fn reorder_project_groups(
+        &mut self,
+        from: &ProjectGroupKey,
+        to: &ProjectGroupKey,
+        edge: DropEdge,
+    ) {
+        Self::reorder_project_groups_in_vec(&mut self.project_groups, from, to, edge);
     }
 
     pub fn set_all_groups_expanded(&mut self, expanded: bool) {
@@ -2206,5 +2248,112 @@ impl Render for MultiWorkspace {
                 ..Tiling::default()
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod project_reorder_tests {
+    use super::*;
+
+    fn fake_key(path: &str) -> ProjectGroupKey {
+        ProjectGroupKey::new(None, PathList::new(&[PathBuf::from(path)]))
+    }
+
+    fn fake_state(path: &str) -> ProjectGroupState {
+        ProjectGroupState {
+            key: fake_key(path),
+            expanded: true,
+            last_active_workspace: None,
+        }
+    }
+
+    #[test]
+    fn test_reorder_moves_group_above_target() {
+        let mut groups = vec![fake_state("/a"), fake_state("/b"), fake_state("/c")];
+        MultiWorkspace::reorder_project_groups_in_vec(
+            &mut groups,
+            &fake_key("/c"),
+            &fake_key("/a"),
+            DropEdge::Above,
+        );
+        assert_eq!(
+            groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            vec![fake_key("/c"), fake_key("/a"), fake_key("/b")]
+        );
+    }
+
+    #[test]
+    fn test_reorder_moves_group_below_target() {
+        let mut groups = vec![fake_state("/a"), fake_state("/b"), fake_state("/c")];
+        MultiWorkspace::reorder_project_groups_in_vec(
+            &mut groups,
+            &fake_key("/a"),
+            &fake_key("/b"),
+            DropEdge::Below,
+        );
+        assert_eq!(
+            groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            vec![fake_key("/b"), fake_key("/a"), fake_key("/c")]
+        );
+    }
+
+    #[test]
+    fn test_reorder_self_is_noop() {
+        let mut groups = vec![fake_state("/a"), fake_state("/b")];
+        MultiWorkspace::reorder_project_groups_in_vec(
+            &mut groups,
+            &fake_key("/a"),
+            &fake_key("/a"),
+            DropEdge::Above,
+        );
+        assert_eq!(
+            groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            vec![fake_key("/a"), fake_key("/b")]
+        );
+    }
+
+    #[test]
+    fn test_reorder_missing_from_is_noop() {
+        let mut groups = vec![fake_state("/a"), fake_state("/b")];
+        MultiWorkspace::reorder_project_groups_in_vec(
+            &mut groups,
+            &fake_key("/missing"),
+            &fake_key("/a"),
+            DropEdge::Above,
+        );
+        assert_eq!(
+            groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            vec![fake_key("/a"), fake_key("/b")]
+        );
+    }
+
+    #[test]
+    fn test_reorder_missing_to_is_noop() {
+        let mut groups = vec![fake_state("/a"), fake_state("/b")];
+        MultiWorkspace::reorder_project_groups_in_vec(
+            &mut groups,
+            &fake_key("/a"),
+            &fake_key("/missing"),
+            DropEdge::Below,
+        );
+        assert_eq!(
+            groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            vec![fake_key("/a"), fake_key("/b")]
+        );
+    }
+
+    #[test]
+    fn test_reorder_moves_group_below_non_adjacent_forward_target() {
+        let mut groups = vec![fake_state("/a"), fake_state("/b"), fake_state("/c")];
+        MultiWorkspace::reorder_project_groups_in_vec(
+            &mut groups,
+            &fake_key("/a"),
+            &fake_key("/c"),
+            DropEdge::Below,
+        );
+        assert_eq!(
+            groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+            vec![fake_key("/b"), fake_key("/c"), fake_key("/a")]
+        );
     }
 }
