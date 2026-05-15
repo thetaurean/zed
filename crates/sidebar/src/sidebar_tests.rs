@@ -107,6 +107,28 @@ fn project_header_keys(
     })
 }
 
+fn worktree_header_paths(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+    group_key: &ProjectGroupKey,
+) -> Vec<PathBuf> {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::WorktreeHeader {
+                    project_group_key,
+                    worktree_path,
+                    ..
+                } if project_group_key == group_key => Some(worktree_path.clone()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
 #[track_caller]
 fn assert_remote_project_integration_sidebar_state(
     sidebar: &mut Sidebar,
@@ -4267,6 +4289,78 @@ async fn test_threads_grouped_under_worktree_header(cx: &mut TestAppContext) {
         assert!(project_ix < worktree_ix);
         assert!(worktree_ix < thread_ix);
     });
+}
+
+#[gpui::test]
+async fn test_worktree_reorder_within_group(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/group-root/a",
+        serde_json::json!({ ".git": {}, "src": {} }),
+    )
+    .await;
+    fs.insert_tree(
+        "/group-root/b",
+        serde_json::json!({ ".git": {}, "src": {} }),
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+    let project = project::Project::test(
+        fs,
+        [Path::new("/group-root/a"), Path::new("/group-root/b")],
+        cx,
+    )
+    .await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("s1")),
+        Some("Thread A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let group_key = sidebar
+        .read_with(cx, |sidebar, _cx| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                    _ => None,
+                })
+        })
+        .expect("project header should exist");
+
+    let initial = worktree_header_paths(&sidebar, cx, &group_key);
+    assert_eq!(initial.len(), 2, "expected two worktree headers");
+    assert!(initial.contains(&PathBuf::from("/group-root/a")));
+    assert!(initial.contains(&PathBuf::from("/group-root/b")));
+    let reordered = vec![initial[1].clone(), initial[0].clone()];
+
+    let identity = remote_connection_identity_for_group(&group_key);
+    let canonical = canonical_group_path_list(&group_key);
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_worktree_order_for_group(identity, canonical, reordered.clone(), cx);
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let after = worktree_header_paths(&sidebar, cx, &group_key);
+    assert_eq!(after, reordered);
 }
 
 #[gpui::test]
