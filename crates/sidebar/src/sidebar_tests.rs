@@ -1194,7 +1194,7 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
 
-    // Entries: [header, thread3, thread2, thread1]
+    // Entries: [project header, worktree header, thread3, thread2, thread1]
     // Focusing the sidebar does not set a selection; select_next/select_previous
     // handle None gracefully by starting from the first or last entry.
     focus_sidebar(&sidebar, cx);
@@ -1214,6 +1214,9 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
 
+    cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
+
     // At the end, wraps back to first entry
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
@@ -1225,8 +1228,13 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
 
     // Move back up
+    cx.dispatch_action(SelectPrevious);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+
     cx.dispatch_action(SelectPrevious);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
 
@@ -1256,7 +1264,7 @@ async fn test_keyboard_select_first_and_last(cx: &mut TestAppContext) {
 
     // SelectLast jumps to the end
     cx.dispatch_action(SelectLast);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
 
     // SelectFirst jumps to the beginning
     cx.dispatch_action(SelectFirst);
@@ -1413,11 +1421,16 @@ async fn test_keyboard_collapse_from_child_selects_parent(cx: &mut TestAppContex
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
 
-    // Focus sidebar (selection starts at None), then navigate down to the thread (child)
+    // Focus sidebar (selection starts at None), then select the thread child.
     focus_sidebar(&sidebar, cx);
-    cx.dispatch_action(SelectNext);
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
+    let thread_index = entry_index_for_thread_title(&sidebar, "Thread 1", cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(thread_index);
+    });
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.selection),
+        Some(thread_index)
+    );
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
@@ -1428,16 +1441,22 @@ async fn test_keyboard_collapse_from_child_selects_parent(cx: &mut TestAppContex
         ]
     );
 
-    // Pressing left on a child collapses the parent group and selects it
+    // Pressing left on a child collapses the parent worktree header and selects it.
     cx.dispatch_action(SelectParent);
     cx.run_until_parked();
 
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.selection),
+        Some(thread_index - 1)
+    );
+    let headers = worktree_headers(&sidebar, cx);
+    assert_eq!(headers.len(), 1);
+    assert!(headers[0].3, "worktree header should be collapsed");
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec![
             //
-            "> [my-project]  <== selected",
+            "v [my-project]",
         ]
     );
 }
@@ -1463,8 +1482,12 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
-    // SelectNext with only one entry stays at index 0
+    // SelectNext advances to the worktree header.
     cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
+
+    // SelectPrevious returns to the project header.
+    cx.dispatch_action(SelectPrevious);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
     // SelectPrevious from first entry clears selection (returns to editor)
@@ -1473,7 +1496,7 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
 
     // SelectPrevious from None selects the last entry
     cx.dispatch_action(SelectPrevious);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
 }
 
 #[gpui::test]
@@ -2328,8 +2351,9 @@ async fn test_escape_from_search_focuses_first_thread(cx: &mut TestAppContext) {
     // Second Escape moves focus from the empty search field to the thread list.
     cx.dispatch_action(Cancel);
     cx.run_until_parked();
+    let alpha_thread_index = entry_index_for_thread_title(&sidebar, "Alpha thread", cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
-        assert_eq!(sidebar.selection, Some(1));
+        assert_eq!(sidebar.selection, Some(alpha_thread_index));
         assert!(sidebar.focus_handle.is_focused(window));
         assert!(!sidebar.filter_editor.read(cx).is_focused(window));
     });
@@ -2703,12 +2727,13 @@ async fn test_confirm_on_historical_thread_activates_workspace(cx: &mut TestAppC
         workspace_1
     );
 
-    // Confirm on the historical (non-live) thread at index 1.
+    // Confirm on the historical (non-live) thread.
     // Before a previous fix, the workspace field was Option<usize> and
     // historical threads had None, so activate_thread early-returned
     // without switching the workspace.
+    let historical_thread_index = entry_index_for_thread_title(&sidebar, "Historical Thread", cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.selection = Some(1);
+        sidebar.selection = Some(historical_thread_index);
         sidebar.confirm(&Confirm, window, cx);
     });
     cx.run_until_parked();
@@ -2884,8 +2909,10 @@ async fn test_confirm_on_historical_thread_in_new_project_group_opens_real_threa
         "should start without an open workspace for the new project group"
     );
 
+    let historical_thread_index =
+        entry_index_for_thread_title(&sidebar, "Historical Thread in New Group", cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.selection = Some(2);
+        sidebar.selection = Some(historical_thread_index);
         sidebar.confirm(&Confirm, window, cx);
     });
 
@@ -4802,8 +4829,8 @@ async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppC
         vec![
             //
             "v [project]",
-            "  Thread B {wt-feature-b}",
             "  Thread A {wt-feature-a}",
+            "  Thread B {wt-feature-b}",
         ]
     );
 
@@ -4824,8 +4851,8 @@ async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppC
         vec![
             //
             "v [project]",
-            "  Thread B {wt-feature-b}",
             "  Thread A {wt-feature-a}",
+            "  Thread B {wt-feature-b}",
         ]
     );
 }
@@ -10400,8 +10427,8 @@ async fn test_worktree_add_only_regroups_threads_for_changed_workspace(cx: &mut 
         visible_entries_as_strings(&sidebar, cx),
         vec![
             "v [project]",
-            "  Worktree Thread {wt-feature}",
             "  Main Thread",
+            "  Worktree Thread {wt-feature}",
         ]
     );
 

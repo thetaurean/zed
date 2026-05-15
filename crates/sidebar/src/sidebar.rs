@@ -546,7 +546,12 @@ fn primary_worktree_folder_for_thread(
             return Some(thread_path.to_path_buf());
         }
     }
-    group_folder_paths.first().cloned()
+    group_folder_paths.first().cloned().or_else(|| {
+        thread_folder_paths
+            .ordered_paths()
+            .next()
+            .map(PathBuf::from)
+    })
 }
 
 fn canonical_group_path_list(key: &ProjectGroupKey) -> String {
@@ -1826,6 +1831,17 @@ impl Sidebar {
                                 }
                             }
                         }
+
+                        for worktree in project.visible_worktrees(cx) {
+                            let worktree_path = worktree.read(cx).abs_path().to_path_buf();
+                            if seen.insert(worktree_path.clone()) {
+                                worktree_name_by_path.insert(
+                                    worktree_path.clone(),
+                                    file_name_or_path_string(&worktree_path),
+                                );
+                                group_folder_paths.push(worktree_path);
+                            }
+                        }
                     }
                 }
 
@@ -1835,6 +1851,16 @@ impl Sidebar {
                         thread.metadata.folder_paths(),
                         &group_folder_paths,
                     ) {
+                        if !group_folder_paths
+                            .iter()
+                            .any(|worktree_path| worktree_path == &primary_path)
+                        {
+                            worktree_name_by_path.insert(
+                                primary_path.clone(),
+                                file_name_or_path_string(&primary_path),
+                            );
+                            group_folder_paths.push(primary_path.clone());
+                        }
                         threads_by_worktree
                             .entry(primary_path)
                             .or_default()
