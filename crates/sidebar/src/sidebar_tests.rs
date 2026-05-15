@@ -90,6 +90,23 @@ fn has_thread_entry(sidebar: &Sidebar, session_id: &acp::SessionId) -> bool {
         .any(|entry| matches!(entry, ListEntry::Thread(t) if t.metadata.session_id.as_ref() == Some(session_id)))
 }
 
+fn project_header_keys(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<ProjectGroupKey> {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
 #[track_caller]
 fn assert_remote_project_integration_sidebar_state(
     sidebar: &mut Sidebar,
@@ -1971,6 +1988,91 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     });
 
     assert_eq!(parent_status, AgentThreadStatus::WaitingForConfirmation);
+}
+
+#[gpui::test]
+async fn test_project_header_reorder_persists(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        cx.set_global(db::AppDatabase::test_new());
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/proj-a", serde_json::json!({ "src": {} }))
+        .await;
+    fs.insert_tree("/proj-b", serde_json::json!({ "src": {} }))
+        .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project_a = project::Project::test(fs.clone(), ["/proj-a".as_ref()], cx).await;
+    let project_b = project::Project::test(fs, ["/proj-b".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let window_id =
+        multi_workspace.update_in(cx, |_, window, _cx| window.window_handle().window_id());
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b.clone(), window, cx);
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("a")),
+        Some("A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_a,
+        cx,
+    );
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("b")),
+        Some("B".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_b,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let project_a_key = cx.update(|_, cx| project_a.read(cx).project_group_key(cx));
+    let project_b_key = cx.update(|_, cx| project_b.read(cx).project_group_key(cx));
+    let initial = project_header_keys(&sidebar, cx);
+    assert_eq!(
+        initial,
+        vec![project_b_key.clone(), project_a_key.clone()],
+        "expected newly activated project to be listed first before reorder"
+    );
+
+    sidebar.update(cx, |sidebar, cx| {
+        let dragged = DraggedSidebarHeader::Project(project_a_key.clone());
+        sidebar.on_project_drop_for_test(&dragged, &project_b_key, DropEdge::Above, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace
+        .update(cx, |multi_workspace, _cx| {
+            multi_workspace.flush_serialization()
+        })
+        .await;
+
+    let reordered = vec![project_a_key.clone(), project_b_key.clone()];
+    assert_eq!(project_header_keys(&sidebar, cx), reordered);
+
+    let persisted_project_groups = cx.update(|_, cx| {
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        let json = kvp
+            .scoped("multi_workspace_state")
+            .read(&window_id.as_u64().to_string())
+            .expect("multi-workspace state should be readable")
+            .expect("multi-workspace state should be persisted");
+        let state: workspace::MultiWorkspaceState =
+            serde_json::from_str(&json).expect("multi-workspace state should deserialize");
+        state
+            .project_groups
+            .into_iter()
+            .map(ProjectGroupKey::from)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(persisted_project_groups, reordered);
 }
 
 #[gpui::test]

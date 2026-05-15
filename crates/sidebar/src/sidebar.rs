@@ -2012,6 +2012,17 @@ impl Sidebar {
         self.update_entries(cx);
     }
 
+    #[cfg(test)]
+    fn on_project_drop_for_test(
+        &mut self,
+        dragged: &DraggedSidebarHeader,
+        target_key: &ProjectGroupKey,
+        edge: DropEdge,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_project_drop(dragged, target_key, edge, cx);
+    }
+
     fn on_worktree_drop(
         &mut self,
         dragged: &DraggedSidebarHeader,
