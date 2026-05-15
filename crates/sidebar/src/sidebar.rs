@@ -2276,6 +2276,21 @@ impl Sidebar {
         )
     }
 
+    fn render_drop_indicator_bar(edge: DropEdge, cx: &App) -> AnyElement {
+        let bar = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .h(px(2.0))
+            .bg(cx.theme().colors().drop_target_background);
+
+        match edge {
+            DropEdge::Above => bar.top_0(),
+            DropEdge::Below => bar.bottom_0(),
+        }
+        .into_any_element()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_worktree_header(
         &mut self,
@@ -2347,6 +2362,18 @@ impl Sidebar {
         let worktree_path_for_drag_move = worktree_path.clone();
         let project_group_key_for_drop = project_group_key.clone();
         let worktree_path_for_drop = worktree_path.clone();
+        let drop_indicator_edge = match &self.drop_target {
+            Some(DropTargetIndicator::Worktree {
+                project_group_key: target_project_group_key,
+                target_path,
+                edge,
+            }) if target_project_group_key == &project_group_key
+                && target_path == &worktree_path =>
+            {
+                Some(*edge)
+            }
+            _ => None,
+        };
         let project_group_key_for_menu = project_group_key;
         let worktree_path_for_menu = worktree_path;
 
@@ -2423,7 +2450,12 @@ impl Sidebar {
                         cx,
                     );
                 })
-            })
+            });
+
+        let header = div()
+            .id(format!("worktree-header-{ix}-drop-target"))
+            .relative()
+            .child(row)
             .on_drag(
                 DraggedSidebarHeader::Worktree {
                     project_group_key: project_group_key_for_drag,
@@ -2517,10 +2549,13 @@ impl Sidebar {
                         cx,
                     );
                 })
+            })
+            .when_some(drop_indicator_edge, |this, edge| {
+                this.child(Self::render_drop_indicator_bar(edge, cx))
             });
 
         let _ = window;
-        row.into_any_element()
+        header.into_any_element()
     }
 
     fn render_project_header(
@@ -2554,6 +2589,12 @@ impl Sidebar {
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
         let key_for_drag = key.clone();
+        let drop_indicator_edge = match &self.drop_target {
+            Some(DropTargetIndicator::Project { target_key, edge }) if target_key == key => {
+                Some(*edge)
+            }
+            _ => None,
+        };
         let drag_label = label.clone();
 
         let label = if highlight_positions.is_empty() {
@@ -2587,7 +2628,7 @@ impl Sidebar {
                 .group_name(group_name_for_gradient.clone())
         };
 
-        let header = h_flex()
+        let header_row = h_flex()
             .id(id)
             .group(&group_name)
             .cursor_pointer()
@@ -2725,7 +2766,12 @@ impl Sidebar {
                         this.toggle_collapse(&key_for_toggle, window, cx);
                     }
                 }),
-            )
+            );
+
+        let header = div()
+            .id(format!("{id_prefix}project-header-{ix}-drop-target"))
+            .relative()
+            .child(header_row)
             .on_drag_move::<DraggedSidebarHeader>({
                 let target_key = key.clone();
                 cx.listener(
@@ -2779,6 +2825,9 @@ impl Sidebar {
                     };
                     this.on_project_drop(dragged, &target_key, edge, cx);
                 })
+            })
+            .when_some(drop_indicator_edge, |this, edge| {
+                this.child(Self::render_drop_indicator_bar(edge, cx))
             })
             .when(!is_sticky, |this| {
                 this.on_drag(DraggedSidebarHeader::Project(key_for_drag), {
