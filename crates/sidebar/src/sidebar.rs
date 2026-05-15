@@ -2012,6 +2012,75 @@ impl Sidebar {
         self.update_entries(cx);
     }
 
+    fn on_worktree_drop(
+        &mut self,
+        dragged: &DraggedSidebarHeader,
+        target_group_key: &ProjectGroupKey,
+        target_path: &Path,
+        edge: DropEdge,
+        cx: &mut Context<Self>,
+    ) {
+        let DraggedSidebarHeader::Worktree {
+            project_group_key: from_group_key,
+            worktree_path: from_path,
+        } = dragged
+        else {
+            self.clear_drop_target(cx);
+            return;
+        };
+
+        if from_group_key != target_group_key || from_path == target_path {
+            self.drop_target = None;
+            cx.notify();
+            return;
+        }
+
+        let mut effective = self
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::WorktreeHeader {
+                    project_group_key,
+                    worktree_path,
+                    ..
+                } if project_group_key == target_group_key => Some(worktree_path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let Some(from_index) = effective.iter().position(|path| path == from_path) else {
+            self.drop_target = None;
+            cx.notify();
+            return;
+        };
+        let moved_path = effective.remove(from_index);
+        let Some(target_index_after_remove) = effective
+            .iter()
+            .position(|path| path.as_path() == target_path)
+        else {
+            self.drop_target = None;
+            cx.notify();
+            return;
+        };
+        let insert_at = match edge {
+            DropEdge::Above => target_index_after_remove,
+            DropEdge::Below => target_index_after_remove + 1,
+        }
+        .min(effective.len());
+        effective.insert(insert_at, moved_path);
+
+        let group_identity = remote_connection_identity_for_group(target_group_key);
+        let group_canonical = canonical_group_path_list(target_group_key);
+        let store_handle = ThreadMetadataStore::global(cx);
+        store_handle.update(cx, |store, cx| {
+            store.set_worktree_order_for_group(group_identity, group_canonical, effective, cx);
+        });
+
+        self.drop_target = None;
+        self.update_entries(cx);
+    }
+
     /// Re-establishes subscriptions to each visible draft's message editor
     /// so we rebuild entries (and their displayed titles) as the user types.
     fn refresh_draft_editor_observations(&mut self, cx: &mut Context<Self>) {
@@ -2274,6 +2343,10 @@ impl Sidebar {
         let worktree_path_for_click = worktree_path.clone();
         let project_group_key_for_drag = project_group_key.clone();
         let worktree_path_for_drag = worktree_path.clone();
+        let project_group_key_for_drag_move = project_group_key.clone();
+        let worktree_path_for_drag_move = worktree_path.clone();
+        let project_group_key_for_drop = project_group_key.clone();
+        let worktree_path_for_drop = worktree_path.clone();
         let project_group_key_for_menu = project_group_key;
         let worktree_path_for_menu = worktree_path;
 
@@ -2366,7 +2439,85 @@ impl Sidebar {
                         })
                     }
                 },
-            );
+            )
+            .on_drag_move::<DraggedSidebarHeader>({
+                cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<DraggedSidebarHeader>, _window, cx| {
+                        let is_current_worktree_target = matches!(
+                            this.drop_target.as_ref(),
+                            Some(DropTargetIndicator::Worktree {
+                                project_group_key: current_group_key,
+                                target_path: current_target_path,
+                                ..
+                            }) if current_group_key == &project_group_key_for_drag_move
+                                && current_target_path == &worktree_path_for_drag_move
+                        );
+
+                        if !event.bounds.contains(&event.event.position) {
+                            if is_current_worktree_target {
+                                this.drop_target = None;
+                                cx.notify();
+                            }
+                            return;
+                        }
+
+                        let dragged = event.drag(cx);
+                        match dragged {
+                            DraggedSidebarHeader::Project(_) => {
+                                if this.drop_target.is_some() {
+                                    this.drop_target = None;
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            DraggedSidebarHeader::Worktree {
+                                project_group_key: from_group_key,
+                                ..
+                            } if from_group_key != &project_group_key_for_drag_move => {
+                                if this.drop_target.is_some() {
+                                    this.drop_target = None;
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            DraggedSidebarHeader::Worktree { .. } => {}
+                        }
+
+                        let new_target = DropTargetIndicator::Worktree {
+                            project_group_key: project_group_key_for_drag_move.clone(),
+                            target_path: worktree_path_for_drag_move.clone(),
+                            edge: Self::compute_drop_edge(event),
+                        };
+                        if this.drop_target.as_ref() != Some(&new_target) {
+                            this.drop_target = Some(new_target);
+                            cx.notify();
+                        }
+                    },
+                )
+            })
+            .on_drop({
+                cx.listener(move |this, dragged: &DraggedSidebarHeader, _window, cx| {
+                    let edge = match &this.drop_target {
+                        Some(DropTargetIndicator::Worktree {
+                            project_group_key,
+                            target_path,
+                            edge,
+                        }) if project_group_key == &project_group_key_for_drop
+                            && target_path == &worktree_path_for_drop =>
+                        {
+                            *edge
+                        }
+                        _ => DropEdge::Below,
+                    };
+                    this.on_worktree_drop(
+                        dragged,
+                        &project_group_key_for_drop,
+                        &worktree_path_for_drop,
+                        edge,
+                        cx,
+                    );
+                })
+            });
 
         let _ = window;
         row.into_any_element()
