@@ -2270,6 +2270,12 @@ impl Sidebar {
             .clone();
         let this = cx.weak_entity();
         let branch_chip = Self::render_worktree_branch_chip(branch_name, git_status, cx);
+        let project_group_key_for_click = project_group_key.clone();
+        let worktree_path_for_click = worktree_path.clone();
+        let project_group_key_for_drag = project_group_key.clone();
+        let worktree_path_for_drag = worktree_path.clone();
+        let project_group_key_for_menu = project_group_key;
+        let worktree_path_for_menu = worktree_path;
 
         let menu = PopoverMenu::new(format!("worktree-header-{ix}-menu"))
             .with_handle(menu_handle.clone())
@@ -2283,14 +2289,12 @@ impl Sidebar {
                 .visible_on_hover(&group_name),
             )
             .menu({
-                let project_group_key = project_group_key.clone();
-                let worktree_path = worktree_path.clone();
                 move |window, cx| {
                     let this = this.upgrade()?;
                     Some(this.update(cx, |sidebar, cx| {
                         sidebar.build_worktree_header_menu(
-                            worktree_path.clone(),
-                            project_group_key.clone(),
+                            worktree_path_for_menu.clone(),
+                            project_group_key_for_menu.clone(),
                             has_custom_name,
                             window,
                             cx,
@@ -2340,9 +2344,29 @@ impl Sidebar {
             })
             .on_click({
                 cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.toggle_worktree_collapsed(&project_group_key, worktree_path.clone(), cx);
+                    this.toggle_worktree_collapsed(
+                        &project_group_key_for_click,
+                        worktree_path_for_click.clone(),
+                        cx,
+                    );
                 })
-            });
+            })
+            .on_drag(
+                DraggedSidebarHeader::Worktree {
+                    project_group_key: project_group_key_for_drag,
+                    worktree_path: worktree_path_for_drag,
+                },
+                {
+                    let label = display_name.clone();
+                    let width = self.width;
+                    move |_dragged, _click_offset, _window, cx| {
+                        cx.new(|_| DraggedHeaderView {
+                            label: label.clone(),
+                            width,
+                        })
+                    }
+                },
+            );
 
         let _ = window;
         row.into_any_element()
