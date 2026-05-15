@@ -810,6 +810,7 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
+    prompt_history_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     _extension_subscription: Option<Subscription>,
     _project_subscription: Subscription,
@@ -1142,6 +1143,7 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
+            prompt_history_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
 
             _extension_subscription: extension_subscription,
@@ -4222,6 +4224,56 @@ impl AgentPanel {
             })
     }
 
+    fn render_prompt_history_menu(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let thread_view = self.active_thread_view(cx);
+        let is_disabled = thread_view.is_none();
+
+        PopoverMenu::new("agent-panel-prompt-history")
+            .trigger_with_tooltip(
+                IconButton::new("agent-panel-prompt-history-trigger", IconName::HistoryRerun)
+                    .icon_size(IconSize::Small)
+                    .disabled(is_disabled),
+                Tooltip::text("Prompt History"),
+            )
+            .anchor(Anchor::TopRight)
+            .with_handle(self.prompt_history_menu_handle.clone())
+            .menu(move |window, cx| {
+                let thread_view = thread_view.clone()?;
+                Some(ContextMenu::build(
+                    window,
+                    cx,
+                    move |mut menu, _window, cx| {
+                        menu = menu.header("Prompt History");
+
+                        let previews = thread_view
+                            .update(cx, |thread_view, cx| thread_view.user_prompt_previews(cx));
+
+                        if previews.is_empty() {
+                            menu.push_item(ContextMenuEntry::new("No prompts yet").disabled(true));
+                        }
+
+                        for (entry_ix, preview) in previews {
+                            let entry = ContextMenuEntry::new(preview);
+                            menu.push_item(entry.handler({
+                                let thread_view = thread_view.clone();
+                                move |_window, cx| {
+                                    thread_view.update(cx, |thread_view, cx| {
+                                        thread_view.scroll_to_user_prompt(entry_ix, cx);
+                                    });
+                                }
+                            }));
+                        }
+
+                        menu
+                    },
+                ))
+            })
+    }
+
     fn render_toolbar_back_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
 
@@ -4722,6 +4774,9 @@ impl AgentPanel {
                         .gap_1()
                         .pl_1()
                         .pr_1()
+                        .when(matches!(mode, ToolbarMode::ActiveThread), |this| {
+                            this.child(self.render_prompt_history_menu(window, cx))
+                        })
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .when(matches!(mode, ToolbarMode::ActiveThread), |this| {
                             this.child(search_button)
