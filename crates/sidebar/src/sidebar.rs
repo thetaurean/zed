@@ -2092,6 +2092,18 @@ impl Sidebar {
         self.update_entries(cx);
     }
 
+    #[cfg(test)]
+    fn on_worktree_drop_for_test(
+        &mut self,
+        dragged: &DraggedSidebarHeader,
+        target_group_key: &ProjectGroupKey,
+        target_path: &Path,
+        edge: DropEdge,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_worktree_drop(dragged, target_group_key, target_path, edge, cx);
+    }
+
     /// Re-establishes subscriptions to each visible draft's message editor
     /// so we rebuild entries (and their displayed titles) as the user types.
     fn refresh_draft_editor_observations(&mut self, cx: &mut Context<Self>) {

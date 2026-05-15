@@ -4364,6 +4364,116 @@ async fn test_worktree_reorder_within_group(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_worktree_drop_rejected_across_groups(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for worktree_path in ["/shared", "/group-a/y", "/group-b/p"] {
+        fs.insert_tree(worktree_path, serde_json::json!({ ".git": {}, "src": {} }))
+            .await;
+    }
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project_a = project::Project::test(
+        fs.clone(),
+        [Path::new("/shared"), Path::new("/group-a/y")],
+        cx,
+    )
+    .await;
+    let project_b =
+        project::Project::test(fs, [Path::new("/shared"), Path::new("/group-b/p")], cx).await;
+    project_a
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    project_b
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b.clone(), window, cx);
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("a")),
+        Some("Thread A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_a,
+        cx,
+    );
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("b")),
+        Some("Thread B".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_b,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let project_a_key = cx.update(|_, cx| project_a.read(cx).project_group_key(cx));
+    let project_b_key = cx.update(|_, cx| project_b.read(cx).project_group_key(cx));
+    let group_keys = project_header_keys(&sidebar, cx);
+    assert_eq!(group_keys.len(), 2);
+    assert!(group_keys.contains(&project_a_key));
+    assert!(group_keys.contains(&project_b_key));
+
+    let before_a = worktree_header_paths(&sidebar, cx, &project_a_key);
+    assert_eq!(
+        before_a.len(),
+        2,
+        "expected two worktree headers in group A"
+    );
+    let shared_path = PathBuf::from("/shared");
+    let target_path = PathBuf::from("/group-b/p");
+    assert!(before_a.contains(&shared_path));
+
+    let identity = remote_connection_identity_for_group(&project_b_key);
+    let canonical = canonical_group_path_list(&project_b_key);
+    let before_b = vec![shared_path.clone(), target_path.clone()];
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_worktree_order_for_group(identity, canonical, before_b.clone(), cx);
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        worktree_header_paths(&sidebar, cx, &project_b_key),
+        before_b
+    );
+
+    sidebar.update(cx, |sidebar, cx| {
+        let dragged = DraggedSidebarHeader::Worktree {
+            project_group_key: project_a_key.clone(),
+            worktree_path: shared_path,
+        };
+        sidebar.on_worktree_drop_for_test(
+            &dragged,
+            &project_b_key,
+            &target_path,
+            DropEdge::Below,
+            cx,
+        );
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        worktree_header_paths(&sidebar, cx, &project_a_key),
+        before_a
+    );
+    assert_eq!(
+        worktree_header_paths(&sidebar, cx, &project_b_key),
+        before_b
+    );
+}
+
+#[gpui::test]
 async fn test_empty_worktree_renders_header(cx: &mut TestAppContext) {
     let project = init_test_project_multi(&["/proj-main", "/proj-feature"], cx).await;
     let (multi_workspace, cx) =
