@@ -90,6 +90,45 @@ fn has_thread_entry(sidebar: &Sidebar, session_id: &acp::SessionId) -> bool {
         .any(|entry| matches!(entry, ListEntry::Thread(t) if t.metadata.session_id.as_ref() == Some(session_id)))
 }
 
+fn project_header_keys(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<ProjectGroupKey> {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+fn worktree_header_paths(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+    group_key: &ProjectGroupKey,
+) -> Vec<PathBuf> {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::WorktreeHeader {
+                    project_group_key,
+                    worktree_path,
+                    ..
+                } if project_group_key == group_key => Some(worktree_path.clone()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
 #[track_caller]
 fn assert_remote_project_integration_sidebar_state(
     sidebar: &mut Sidebar,
@@ -128,6 +167,7 @@ fn assert_remote_project_integration_sidebar_state(
                     "expected the only sidebar project header to be `project`"
                 );
             }
+            ListEntry::WorktreeHeader { .. } => {}
             ListEntry::Thread(thread)
                 if thread.metadata.session_id.as_ref() == Some(main_thread_id) =>
             {
@@ -174,6 +214,24 @@ async fn init_test_project(
         .await;
     cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
     project::Project::test(fs, [worktree_path.as_ref()], cx).await
+}
+
+async fn init_test_project_multi(
+    worktree_paths: &[&str],
+    cx: &mut TestAppContext,
+) -> Entity<project::Project> {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for worktree_path in worktree_paths {
+        fs.insert_tree(worktree_path, serde_json::json!({ "src": {} }))
+            .await;
+    }
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+    let root_paths: Vec<&Path> = worktree_paths
+        .iter()
+        .map(|worktree_path| Path::new(worktree_path))
+        .collect();
+    project::Project::test(fs, root_paths, cx).await
 }
 
 fn setup_sidebar(
@@ -490,7 +548,7 @@ fn visible_entries_as_strings(
             .entries
             .iter()
             .enumerate()
-            .map(|(ix, entry)| {
+            .filter_map(|(ix, entry)| {
                 let selected = if sidebar.selection == Some(ix) {
                     "  <== selected"
                 } else {
@@ -508,8 +566,9 @@ fn visible_entries_as_strings(
                         } else {
                             "v"
                         };
-                        format!("{} [{}]{}", icon, label, selected)
+                        Some(format!("{} [{}]{}", icon, label, selected))
                     }
+                    ListEntry::WorktreeHeader { .. } => None,
                     ListEntry::Thread(thread) => {
                         let title = thread.metadata.display_title();
                         let worktree = format_linked_worktree_chips(&thread.worktrees);
@@ -530,17 +589,68 @@ fn visible_entries_as_strings(
                             } else {
                                 ""
                             };
-                            format!("  {title}{worktree}{live}{status_str}{notified}{selected}")
+                            Some(format!(
+                                "  {title}{worktree}{live}{status_str}{notified}{selected}"
+                            ))
                         }
                     }
                     ListEntry::Terminal(terminal) => {
                         let title = &terminal.title;
                         let worktree = format_linked_worktree_chips(&terminal.worktrees);
-                        format!("  {title}{worktree}{selected}")
+                        Some(format!("  {title}{worktree}{selected}"))
                     }
                 }
             })
             .collect()
+    })
+}
+
+fn worktree_headers(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<(PathBuf, SharedString, usize, bool)> {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::WorktreeHeader {
+                    worktree_path,
+                    display_name,
+                    thread_count,
+                    is_collapsed,
+                    ..
+                } => Some((
+                    worktree_path.clone(),
+                    display_name.clone(),
+                    *thread_count,
+                    *is_collapsed,
+                )),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+fn entry_index_for_thread_title(
+    sidebar: &Entity<Sidebar>,
+    title: &str,
+    cx: &mut gpui::VisualTestContext,
+) -> usize {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::Thread(thread)
+                        if thread.metadata.display_title().as_ref() == title
+                )
+            })
+            .expect("thread entry should be present")
     })
 }
 
@@ -1084,7 +1194,7 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
 
-    // Entries: [header, thread3, thread2, thread1]
+    // Entries: [project header, worktree header, thread3, thread2, thread1]
     // Focusing the sidebar does not set a selection; select_next/select_previous
     // handle None gracefully by starting from the first or last entry.
     focus_sidebar(&sidebar, cx);
@@ -1104,6 +1214,9 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
 
+    cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
+
     // At the end, wraps back to first entry
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
@@ -1115,8 +1228,13 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
 
     // Move back up
+    cx.dispatch_action(SelectPrevious);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+
     cx.dispatch_action(SelectPrevious);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
 
@@ -1146,7 +1264,7 @@ async fn test_keyboard_select_first_and_last(cx: &mut TestAppContext) {
 
     // SelectLast jumps to the end
     cx.dispatch_action(SelectLast);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
 
     // SelectFirst jumps to the beginning
     cx.dispatch_action(SelectFirst);
@@ -1303,11 +1421,16 @@ async fn test_keyboard_collapse_from_child_selects_parent(cx: &mut TestAppContex
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
 
-    // Focus sidebar (selection starts at None), then navigate down to the thread (child)
+    // Focus sidebar (selection starts at None), then select the thread child.
     focus_sidebar(&sidebar, cx);
-    cx.dispatch_action(SelectNext);
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
+    let thread_index = entry_index_for_thread_title(&sidebar, "Thread 1", cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(thread_index);
+    });
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.selection),
+        Some(thread_index)
+    );
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
@@ -1318,16 +1441,22 @@ async fn test_keyboard_collapse_from_child_selects_parent(cx: &mut TestAppContex
         ]
     );
 
-    // Pressing left on a child collapses the parent group and selects it
+    // Pressing left on a child collapses the parent worktree header and selects it.
     cx.dispatch_action(SelectParent);
     cx.run_until_parked();
 
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.selection),
+        Some(thread_index - 1)
+    );
+    let headers = worktree_headers(&sidebar, cx);
+    assert_eq!(headers.len(), 1);
+    assert!(headers[0].3, "worktree header should be collapsed");
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec![
             //
-            "> [my-project]  <== selected",
+            "v [my-project]",
         ]
     );
 }
@@ -1353,8 +1482,12 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
-    // SelectNext with only one entry stays at index 0
+    // SelectNext advances to the worktree header.
     cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
+
+    // SelectPrevious returns to the project header.
+    cx.dispatch_action(SelectPrevious);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
     // SelectPrevious from first entry clears selection (returns to editor)
@@ -1363,7 +1496,7 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
 
     // SelectPrevious from None selects the last entry
     cx.dispatch_action(SelectPrevious);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
 }
 
 #[gpui::test]
@@ -1903,6 +2036,91 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
 }
 
 #[gpui::test]
+async fn test_project_header_reorder_persists(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        cx.set_global(db::AppDatabase::test_new());
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/proj-a", serde_json::json!({ "src": {} }))
+        .await;
+    fs.insert_tree("/proj-b", serde_json::json!({ "src": {} }))
+        .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project_a = project::Project::test(fs.clone(), ["/proj-a".as_ref()], cx).await;
+    let project_b = project::Project::test(fs, ["/proj-b".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let window_id =
+        multi_workspace.update_in(cx, |_, window, _cx| window.window_handle().window_id());
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b.clone(), window, cx);
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("a")),
+        Some("A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_a,
+        cx,
+    );
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("b")),
+        Some("B".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_b,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let project_a_key = cx.update(|_, cx| project_a.read(cx).project_group_key(cx));
+    let project_b_key = cx.update(|_, cx| project_b.read(cx).project_group_key(cx));
+    let initial = project_header_keys(&sidebar, cx);
+    assert_eq!(
+        initial,
+        vec![project_b_key.clone(), project_a_key.clone()],
+        "expected newly activated project to be listed first before reorder"
+    );
+
+    sidebar.update(cx, |sidebar, cx| {
+        let dragged = DraggedSidebarHeader::Project(project_a_key.clone());
+        sidebar.on_project_drop_for_test(&dragged, &project_b_key, DropEdge::Above, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace
+        .update(cx, |multi_workspace, _cx| {
+            multi_workspace.flush_serialization()
+        })
+        .await;
+
+    let reordered = vec![project_a_key.clone(), project_b_key.clone()];
+    assert_eq!(project_header_keys(&sidebar, cx), reordered);
+
+    let persisted_project_groups = cx.update(|_, cx| {
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        let json = kvp
+            .scoped("multi_workspace_state")
+            .read(&window_id.as_u64().to_string())
+            .expect("multi-workspace state should be readable")
+            .expect("multi-workspace state should be persisted");
+        let state: workspace::MultiWorkspaceState =
+            serde_json::from_str(&json).expect("multi-workspace state should deserialize");
+        state
+            .project_groups
+            .into_iter()
+            .map(ProjectGroupKey::from)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(persisted_project_groups, reordered);
+}
+
+#[gpui::test]
 async fn test_background_thread_completion_triggers_notification(cx: &mut TestAppContext) {
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
     let (multi_workspace, cx) =
@@ -2133,8 +2351,9 @@ async fn test_escape_from_search_focuses_first_thread(cx: &mut TestAppContext) {
     // Second Escape moves focus from the empty search field to the thread list.
     cx.dispatch_action(Cancel);
     cx.run_until_parked();
+    let alpha_thread_index = entry_index_for_thread_title(&sidebar, "Alpha thread", cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
-        assert_eq!(sidebar.selection, Some(1));
+        assert_eq!(sidebar.selection, Some(alpha_thread_index));
         assert!(sidebar.focus_handle.is_focused(window));
         assert!(!sidebar.filter_editor.read(cx).is_focused(window));
     });
@@ -2508,12 +2727,13 @@ async fn test_confirm_on_historical_thread_activates_workspace(cx: &mut TestAppC
         workspace_1
     );
 
-    // Confirm on the historical (non-live) thread at index 1.
+    // Confirm on the historical (non-live) thread.
     // Before a previous fix, the workspace field was Option<usize> and
     // historical threads had None, so activate_thread early-returned
     // without switching the workspace.
+    let historical_thread_index = entry_index_for_thread_title(&sidebar, "Historical Thread", cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.selection = Some(1);
+        sidebar.selection = Some(historical_thread_index);
         sidebar.confirm(&Confirm, window, cx);
     });
     cx.run_until_parked();
@@ -2689,8 +2909,10 @@ async fn test_confirm_on_historical_thread_in_new_project_group_opens_real_threa
         "should start without an open workspace for the new project group"
     );
 
+    let historical_thread_index =
+        entry_index_for_thread_title(&sidebar, "Historical Thread in New Group", cx);
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.selection = Some(2);
+        sidebar.selection = Some(historical_thread_index);
         sidebar.confirm(&Confirm, window, cx);
     });
 
@@ -4037,6 +4259,491 @@ async fn test_git_worktree_added_live_updates_sidebar(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_threads_grouped_under_worktree_header(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("s1")),
+        Some("Thread A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        let project_ix = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, ListEntry::ProjectHeader { .. }))
+            .expect("project header should be present");
+        let worktree_ix = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::WorktreeHeader {
+                        worktree_path,
+                        display_name,
+                        thread_count: 1,
+                        ..
+                    } if worktree_path.as_path() == Path::new("/my-project")
+                        && display_name.as_ref() == "my-project"
+                )
+            })
+            .expect("worktree header should be present");
+        let thread_ix = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::Thread(thread)
+                        if thread.metadata.display_title().as_ref() == "Thread A"
+                )
+            })
+            .expect("thread should be present");
+
+        assert!(project_ix < worktree_ix);
+        assert!(worktree_ix < thread_ix);
+    });
+}
+
+#[gpui::test]
+async fn test_worktree_reorder_within_group(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/group-root/a",
+        serde_json::json!({ ".git": {}, "src": {} }),
+    )
+    .await;
+    fs.insert_tree(
+        "/group-root/b",
+        serde_json::json!({ ".git": {}, "src": {} }),
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+    let project = project::Project::test(
+        fs,
+        [Path::new("/group-root/a"), Path::new("/group-root/b")],
+        cx,
+    )
+    .await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("s1")),
+        Some("Thread A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let group_key = sidebar
+        .read_with(cx, |sidebar, _cx| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                    _ => None,
+                })
+        })
+        .expect("project header should exist");
+
+    let initial = worktree_header_paths(&sidebar, cx, &group_key);
+    assert_eq!(initial.len(), 2, "expected two worktree headers");
+    assert!(initial.contains(&PathBuf::from("/group-root/a")));
+    assert!(initial.contains(&PathBuf::from("/group-root/b")));
+    let reordered = vec![initial[1].clone(), initial[0].clone()];
+
+    let identity = remote_connection_identity_for_group(&group_key);
+    let canonical = canonical_group_path_list(&group_key);
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_worktree_order_for_group(identity, canonical, reordered.clone(), cx);
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let after = worktree_header_paths(&sidebar, cx, &group_key);
+    assert_eq!(after, reordered);
+}
+
+#[gpui::test]
+async fn test_worktree_drop_rejected_across_groups(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    for worktree_path in ["/shared", "/group-a/y", "/group-b/p"] {
+        fs.insert_tree(worktree_path, serde_json::json!({ ".git": {}, "src": {} }))
+            .await;
+    }
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project_a = project::Project::test(
+        fs.clone(),
+        [Path::new("/shared"), Path::new("/group-a/y")],
+        cx,
+    )
+    .await;
+    let project_b =
+        project::Project::test(fs, [Path::new("/shared"), Path::new("/group-b/p")], cx).await;
+    project_a
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    project_b
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b.clone(), window, cx);
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("a")),
+        Some("Thread A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_a,
+        cx,
+    );
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("b")),
+        Some("Thread B".into()),
+        Utc::now(),
+        None,
+        None,
+        &project_b,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let project_a_key = cx.update(|_, cx| project_a.read(cx).project_group_key(cx));
+    let project_b_key = cx.update(|_, cx| project_b.read(cx).project_group_key(cx));
+    let group_keys = project_header_keys(&sidebar, cx);
+    assert_eq!(group_keys.len(), 2);
+    assert!(group_keys.contains(&project_a_key));
+    assert!(group_keys.contains(&project_b_key));
+
+    let before_a = worktree_header_paths(&sidebar, cx, &project_a_key);
+    assert_eq!(
+        before_a.len(),
+        2,
+        "expected two worktree headers in group A"
+    );
+    let shared_path = PathBuf::from("/shared");
+    let target_path = PathBuf::from("/group-b/p");
+    assert!(before_a.contains(&shared_path));
+
+    let identity = remote_connection_identity_for_group(&project_b_key);
+    let canonical = canonical_group_path_list(&project_b_key);
+    let before_b = vec![shared_path.clone(), target_path.clone()];
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_worktree_order_for_group(identity, canonical, before_b.clone(), cx);
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        worktree_header_paths(&sidebar, cx, &project_b_key),
+        before_b
+    );
+
+    sidebar.update(cx, |sidebar, cx| {
+        let dragged = DraggedSidebarHeader::Worktree {
+            project_group_key: project_a_key.clone(),
+            worktree_path: shared_path,
+        };
+        sidebar.on_worktree_drop_for_test(
+            &dragged,
+            &project_b_key,
+            &target_path,
+            DropEdge::Below,
+            cx,
+        );
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        worktree_header_paths(&sidebar, cx, &project_a_key),
+        before_a
+    );
+    assert_eq!(
+        worktree_header_paths(&sidebar, cx, &project_b_key),
+        before_b
+    );
+}
+
+#[gpui::test]
+async fn test_empty_worktree_renders_header(cx: &mut TestAppContext) {
+    let project = init_test_project_multi(&["/proj-main", "/proj-feature"], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata_with_main_paths(
+        "s1",
+        "Thread A",
+        PathList::new(&[PathBuf::from("/proj-main"), PathBuf::from("/proj-feature")]),
+        PathList::new(&[PathBuf::from("/proj-main"), PathBuf::from("/proj-feature")]),
+        Utc::now(),
+        cx,
+    );
+    cx.run_until_parked();
+
+    let headers = worktree_headers(&sidebar, cx);
+    assert_eq!(headers.len(), 2, "headers: {headers:?}");
+    assert!(
+        headers.iter().any(
+            |(path, name, count, _)| path.as_path() == Path::new("/proj-main")
+                && name.as_ref() == "proj-main"
+                && *count == 1
+        ),
+        "headers: {headers:?}"
+    );
+    assert!(
+        headers.iter().any(
+            |(path, name, count, _)| path.as_path() == Path::new("/proj-feature")
+                && name.as_ref() == "proj-feature"
+                && *count == 0
+        ),
+        "headers: {headers:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_inline_rename_persists_in_worktree_header(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("s1")),
+        Some("Thread A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let header_index = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::WorktreeHeader { worktree_path, .. }
+                        if worktree_path.as_path() == Path::new("/my-project")
+                )
+            })
+            .expect("worktree header should be visible")
+    });
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(header_index);
+    });
+    focus_sidebar(&sidebar, cx);
+
+    cx.dispatch_action(RenameWorktreeGroup);
+    cx.run_until_parked();
+
+    let rename_editor = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .worktree_rename_editor
+            .as_ref()
+            .expect("rename editor should be active")
+            .editor
+            .clone()
+    });
+    rename_editor.update_in(cx, |editor, window, cx| {
+        editor.set_text("My Renamed Group", window, cx);
+    });
+
+    cx.dispatch_action(ConfirmWorktreeGroupRename);
+    cx.run_until_parked();
+
+    let headers = worktree_headers(&sidebar, cx);
+    assert!(
+        headers.iter().any(
+            |(path, name, _, _)| path.as_path() == Path::new("/my-project")
+                && name.as_ref() == "My Renamed Group"
+        ),
+        "headers: {headers:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_toggle_fold_from_thread_collapses_worktree_header(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let project_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("s1")),
+        Some("Thread A".into()),
+        Utc::now(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let thread_index = entry_index_for_thread_title(&sidebar, "Thread A", cx);
+    focus_sidebar(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(thread_index);
+    });
+
+    cx.dispatch_action(editor::actions::ToggleFold);
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, cx| {
+        assert!(
+            !sidebar.is_group_collapsed(&project_group_key, cx),
+            "project group should remain expanded"
+        );
+        assert!(
+            matches!(
+                sidebar
+                    .selection
+                    .and_then(|ix| sidebar.contents.entries.get(ix)),
+                Some(ListEntry::WorktreeHeader {
+                    worktree_path,
+                    is_collapsed: true,
+                    ..
+                }) if worktree_path.as_path() == Path::new("/my-project")
+            ),
+            "selection should move to the collapsed worktree header"
+        );
+        assert!(sidebar.contents.entries.iter().all(|entry| {
+            !matches!(
+                entry,
+                ListEntry::Thread(thread)
+                    if thread.metadata.display_title().as_ref() == "Thread A"
+            )
+        }));
+    });
+}
+
+#[gpui::test]
+async fn test_worktree_override_persists_when_project_group_removed(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let project_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let worktree_path = PathBuf::from("/my-project");
+
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_worktree_custom_name(
+                None,
+                worktree_path.clone(),
+                SharedString::from("renamed"),
+                cx,
+            );
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .worktree_custom_name(None, &worktree_path),
+            Some(SharedString::from("renamed"))
+        );
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace
+            .remove_project_group(&project_group_key, window, cx)
+            .detach_and_log_err(cx);
+    });
+    cx.run_until_parked();
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .worktree_custom_name(None, &worktree_path),
+            Some(SharedString::from("renamed"))
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_worktree_override_persists_when_project_group_collapsed(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let project_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let worktree_path = PathBuf::from("/my-project");
+
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_worktree_custom_name(
+                None,
+                worktree_path.clone(),
+                SharedString::from("renamed"),
+                cx,
+            );
+        });
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.set_group_expanded(&project_group_key, false, cx);
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .worktree_custom_name(None, &worktree_path),
+            Some(SharedString::from("renamed"))
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
@@ -4122,8 +4829,8 @@ async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppC
         vec![
             //
             "v [project]",
-            "  Thread B {wt-feature-b}",
             "  Thread A {wt-feature-a}",
+            "  Thread B {wt-feature-b}",
         ]
     );
 
@@ -4144,8 +4851,8 @@ async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppC
         vec![
             //
             "v [project]",
-            "  Thread B {wt-feature-b}",
             "  Thread A {wt-feature-a}",
+            "  Thread B {wt-feature-b}",
         ]
     );
 }
@@ -4640,8 +5347,9 @@ async fn test_clicking_worktree_thread_opens_workspace_when_none_exists(cx: &mut
 
     // Focus the sidebar and select the worktree thread.
     focus_sidebar(&sidebar, cx);
+    let wt_thread_index = entry_index_for_thread_title(&sidebar, "WT Thread", cx);
     sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(1); // index 0 is header, 1 is the thread
+        sidebar.selection = Some(wt_thread_index);
     });
 
     // Confirm to open the worktree thread.
@@ -4727,8 +5435,9 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
     );
 
     focus_sidebar(&sidebar, cx);
+    let wt_thread_index = entry_index_for_thread_title(&sidebar, "WT Thread", cx);
     sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(1); // index 0 is header, 1 is the thread
+        sidebar.selection = Some(wt_thread_index);
     });
 
     let assert_sidebar_state = |sidebar: &mut Sidebar, _cx: &mut Context<Sidebar>| {
@@ -4763,6 +5472,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         "expected the only sidebar project header to be `project`"
                     );
                 }
+                ListEntry::WorktreeHeader { .. } => {}
                 ListEntry::Thread(thread)
                     if thread.metadata.title.as_ref().map(|t| t.as_ref()) == Some("WT Thread")
                         && thread
@@ -4885,10 +5595,7 @@ async fn test_clicking_absorbed_worktree_thread_activates_worktree_workspace(
     assert!(entries.contains(&"  Main Thread".to_string()));
     assert!(entries.contains(&"  WT Thread {wt-feature-a}".to_string()));
 
-    let wt_thread_index = entries
-        .iter()
-        .position(|e| e.contains("WT Thread"))
-        .expect("should find the worktree thread entry");
+    let wt_thread_index = entry_index_for_thread_title(&sidebar, "WT Thread", cx);
 
     assert_eq!(
         multi_workspace.read_with(cx, |mw, _| mw.workspace().clone()),
@@ -9720,8 +10427,8 @@ async fn test_worktree_add_only_regroups_threads_for_changed_workspace(cx: &mut 
         visible_entries_as_strings(&sidebar, cx),
         vec![
             "v [project]",
-            "  Worktree Thread {wt-feature}",
             "  Main Thread",
+            "  Worktree Thread {wt-feature}",
         ]
     );
 
