@@ -1,5 +1,5 @@
 use crate::{
-    DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
+    DEFAULT_THREAD_TITLE, SelectPermissionGranularity, ToggleSearch,
     agent_configuration::configure_context_server_modal::default_markdown_style,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
@@ -14,14 +14,15 @@ use feature_flags::AcpBetaFeatureFlag;
 
 use crate::message_editor::SharedSessionCapabilities;
 
-use gpui::List;
 use gpui::TaskExt;
+use gpui::{KeyContext, List};
 use heapless::Vec as ArrayVec;
 use language_model::{LanguageModelEffortLevel, Speed};
 use settings::update_settings_file;
 use ui::{ButtonLike, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle, Tab};
 use workspace::SERIALIZATION_THROTTLE_TIME;
 
+use super::thread_search::ThreadSearch;
 use super::*;
 
 #[derive(Default)]
@@ -326,6 +327,7 @@ pub struct ThreadView {
     pub in_flight_prompt: Option<Vec<acp::ContentBlock>>,
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
+    pub thread_search: ThreadSearch,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub project: WeakEntity<Project>,
@@ -540,6 +542,32 @@ impl ThreadView {
             }));
         }));
 
+        let mut thread_search = ThreadSearch::new(window, cx);
+        let query_editor = thread_search.query_editor.clone();
+        thread_search._subscriptions.push(cx.subscribe_in(
+            &query_editor,
+            window,
+            |this, _, event, _window, cx| {
+                if let editor::EditorEvent::BufferEdited = event {
+                    this.refresh_thread_search(cx);
+                }
+            },
+        ));
+        thread_search
+            ._subscriptions
+            .push(cx.subscribe(&thread, |this, _thread, event, cx| {
+                if matches!(
+                    event,
+                    AcpThreadEvent::NewEntry
+                        | AcpThreadEvent::EntryUpdated(_)
+                        | AcpThreadEvent::EntriesRemoved(_)
+                ) && !this.thread_search.dismissed
+                    && !this.thread_search.query(cx).is_empty()
+                {
+                    this.refresh_thread_search(cx);
+                }
+            }));
+
         let mut this = Self {
             root_thread_id,
             session_id,
@@ -599,6 +627,7 @@ impl ThreadView {
             hovered_edited_file_buttons: None,
             in_flight_prompt: None,
             message_editor,
+            thread_search,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
             project,
@@ -1607,6 +1636,138 @@ impl ThreadView {
         });
 
         self.send_content(contents_task, window, cx);
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.thread_search.dismissed {
+            self.thread_search.deploy(window, cx);
+            self.refresh_thread_search(cx);
+        } else {
+            self.thread_search.clear_highlights(cx);
+            self.thread_search.dismiss(window, cx);
+            self.message_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn key_context(&self, window: &Window, cx: &App) -> KeyContext {
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add("AcpThread");
+
+        if !self.thread_search.dismissed
+            && self
+                .thread_search
+                .query_editor_focus_handle(cx)
+                .contains_focused(window, cx)
+        {
+            key_context.add("ThreadSearch");
+        }
+
+        key_context
+    }
+
+    fn refresh_thread_search(&mut self, cx: &mut Context<Self>) {
+        self.thread_search.clear_highlights(cx);
+        let entries = self.thread.read(cx).entries();
+        let sources = super::thread_search::collect_searchable_markdowns(
+            entries,
+            self.thread_search.include_tool_calls,
+        );
+        self.thread_search.update_matches(&sources, cx);
+        self.thread_search.apply_highlights(cx);
+        cx.notify();
+    }
+
+    fn thread_search_select_next(
+        &mut self,
+        _: &menu::SelectNext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.thread_search.dismissed {
+            self.advance_thread_search(1, cx);
+        }
+    }
+
+    fn thread_search_select_prev(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.thread_search.dismissed {
+            self.advance_thread_search(-1, cx);
+        }
+    }
+
+    fn toggle_search_include_tool_calls(
+        &mut self,
+        _: &crate::ToggleSearchIncludeToolCalls,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.include_tool_calls = !self.thread_search.include_tool_calls;
+        self.refresh_thread_search(cx);
+    }
+
+    fn toggle_search_case_sensitive(
+        &mut self,
+        _: &crate::ToggleSearchCaseSensitive,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.options.case_sensitive = !self.thread_search.options.case_sensitive;
+        self.refresh_thread_search(cx);
+    }
+
+    fn toggle_search_whole_word(
+        &mut self,
+        _: &crate::ToggleSearchWholeWord,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.options.whole_word = !self.thread_search.options.whole_word;
+        self.refresh_thread_search(cx);
+    }
+
+    fn toggle_search_regex(
+        &mut self,
+        _: &crate::ToggleSearchRegex,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search.dismissed {
+            return;
+        }
+
+        self.thread_search.options.regex = !self.thread_search.options.regex;
+        self.refresh_thread_search(cx);
+    }
+
+    fn advance_thread_search(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let active_entry_index = self.thread_search.step_active(delta);
+        self.thread_search.apply_highlights(cx);
+
+        if let Some(entry_index) = active_entry_index {
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix: entry_index,
+                offset_in_item: gpui::px(0.0),
+            });
+        }
+
+        cx.notify();
     }
 
     pub fn move_queued_message_to_main_editor(
@@ -9107,7 +9268,7 @@ impl Render for ThreadView {
             });
 
         v_flex()
-            .key_context("AcpThread")
+            .key_context(self.key_context(window, cx))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
@@ -9142,6 +9303,15 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(|this, _: &ToggleSearch, window, cx| {
+                this.toggle_search(window, cx);
+            }))
+            .on_action(cx.listener(Self::thread_search_select_next))
+            .on_action(cx.listener(Self::thread_search_select_prev))
+            .on_action(cx.listener(Self::toggle_search_include_tool_calls))
+            .on_action(cx.listener(Self::toggle_search_case_sensitive))
+            .on_action(cx.listener(Self::toggle_search_whole_word))
+            .on_action(cx.listener(Self::toggle_search_regex))
             .on_action(cx.listener(|this, _: &ToggleFastMode, _window, cx| {
                 this.toggle_fast_mode(cx);
             }))
@@ -9282,6 +9452,7 @@ impl Render for ThreadView {
             }))
             .size_full()
             .children(self.render_subagent_titlebar(cx))
+            .children(self.thread_search.render(cx))
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
             .children(self.render_skill_loading_errors(cx))

@@ -4284,6 +4284,9 @@ impl AgentPanel {
             }
             BaseView::Terminal { .. } | BaseView::Uninitialized => None,
         };
+        let active_thread_focus_handle = self
+            .active_conversation_view()
+            .map(|conversation_view| conversation_view.focus_handle(cx));
 
         let new_thread_menu_builder: Rc<
             dyn Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>>,
@@ -4582,6 +4585,21 @@ impl AgentPanel {
                 this.toggle_zoom(&ToggleZoom, window, cx);
             }));
 
+        let search_button = {
+            let focus_handle = focus_handle.clone();
+            IconButton::new("thread-search-toggle", IconName::MagnifyingGlass)
+                .shape(ui::IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .tooltip(move |_window, cx| {
+                    Tooltip::for_action_in("Search Thread", &crate::ToggleSearch, &focus_handle, cx)
+                })
+                .on_click(move |_, window, cx| {
+                    if let Some(focus_handle) = &active_thread_focus_handle {
+                        focus_handle.dispatch_action(&crate::ToggleSearch, window, cx);
+                    }
+                })
+        };
+
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
         let base_container = h_flex()
@@ -4705,6 +4723,9 @@ impl AgentPanel {
                         .pl_1()
                         .pr_1()
                         .when(can_create_entries, |this| this.child(new_thread_menu))
+                        .when(matches!(mode, ToolbarMode::ActiveThread), |this| {
+                            this.child(search_button)
+                        })
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
@@ -6643,6 +6664,96 @@ mod tests {
         });
 
         (panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_thread_search_finds_matches_across_messages(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("assistant alpha response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut cx);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let message_editor = thread_view.read_with(&cx, |view, _cx| view.message_editor.clone());
+        message_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("user alpha prompt", window, cx);
+        });
+        thread_view.update_in(&mut cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let focus_handle = thread_view.read_with(&cx, |view, cx| view.focus_handle(cx));
+        cx.update(|window, cx| {
+            focus_handle.dispatch_action(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+
+        let query_editor = thread_view.read_with(&cx, |view, _cx| {
+            assert!(!view.thread_search.dismissed);
+            view.thread_search.query_editor.clone()
+        });
+        query_editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("alpha", window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |view, _cx| {
+            assert_eq!(view.thread_search.matches.len(), 2);
+            assert_eq!(view.thread_search.active_match_index, Some(0));
+        });
+
+        cx.update(|window, cx| {
+            focus_handle.dispatch_action(&menu::SelectNext, window, cx);
+        });
+        cx.run_until_parked();
+        thread_view.read_with(&cx, |view, _cx| {
+            assert_eq!(view.thread_search.active_match_index, Some(1));
+        });
+
+        cx.update(|window, cx| {
+            focus_handle.dispatch_action(&menu::SelectNext, window, cx);
+        });
+        cx.run_until_parked();
+        thread_view.read_with(&cx, |view, _cx| {
+            assert_eq!(view.thread_search.active_match_index, Some(0));
+        });
+
+        cx.update(|window, cx| {
+            focus_handle.dispatch_action(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(&cx, |view, _cx| {
+            assert!(view.thread_search.dismissed);
+            assert!(view.thread_search.matches.is_empty());
+        });
     }
 
     #[gpui::test]
